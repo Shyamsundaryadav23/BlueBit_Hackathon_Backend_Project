@@ -1,15 +1,14 @@
-import uuid
-import datetime
-import functools
-import logging
-import os
-import jwt
-import requests
 from flask import Flask, redirect, request, jsonify
 from flask_cors import CORS
-from dotenv import load_dotenv
 import boto3
 from boto3.dynamodb.conditions import Key
+import requests
+import os
+import jwt
+import datetime
+import functools
+from dotenv import load_dotenv
+import logging
 
 # Load environment variables
 load_dotenv()
@@ -31,12 +30,7 @@ JWT_EXPIRATION_HOURS = int(os.getenv('JWT_EXPIRATION_HOURS', '24'))
 # DynamoDB setup
 AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
 dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
-
-# Tables (using defaults if not specified in .env)
 users_table = dynamodb.Table(os.getenv('DYNAMODB_USERS_TABLE', 'Users'))
-groups_table = dynamodb.Table(os.getenv('DYNAMODB_GROUPS_TABLE', 'Groups'))
-expenses_table = dynamodb.Table(os.getenv('DYNAMODB_EXPENSES_TABLE', 'Expenses'))
-transactions_table = dynamodb.Table(os.getenv('DYNAMODB_TRANSACTIONS_TABLE', 'Transactions'))
 
 def token_required(f):
     """Decorator to require a valid JWT token for protected routes."""
@@ -50,8 +44,7 @@ def token_required(f):
             return jsonify({'message': 'Token is missing'}), 401
         try:
             data = jwt.decode(token, app.secret_key, algorithms=['HS256'])
-            # Look up the user by UserID (primary key)
-            response = users_table.get_item(Key={"UserID": data['user_id']})
+            response = users_table.get_item(Key={"email": data['user']})
             if "Item" not in response:
                 return jsonify({'message': 'User not found'}), 401
             current_user = response["Item"]
@@ -160,67 +153,47 @@ def callback():
         
         email = userinfo["email"]
         
-        # Query Users table using EmailIndex
-        query_response = users_table.query(
-            IndexName="EmailIndex",
-            KeyConditionExpression=Key("Email").eq(email)
-        )
-        
-        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        if query_response.get("Items"):
-            # Existing user: update record
-            user_record = query_response["Items"][0]
-            user_id = user_record["UserID"]
-            try:
+        # Create or update user in DynamoDB.
+        try:
+            response = users_table.get_item(Key={"email": email})
+            user_data = {
+                "email": email,
+                "name": userinfo.get("name", ""),
+                "picture": userinfo.get("picture", ""),
+                "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            if "Item" not in response:
+                user_data["created_at"] = user_data["last_login"]
+                users_table.put_item(Item=user_data)
+                logger.info(f"New user created: {email}")
+            else:
                 users_table.update_item(
-                    Key={"UserID": user_id},
+                    Key={"email": email},
                     UpdateExpression="SET #name = :name, picture = :picture, last_login = :last_login",
                     ExpressionAttributeNames={"#name": "name"},
                     ExpressionAttributeValues={
-                        ":name": userinfo.get("name", ""),
-                        ":picture": userinfo.get("picture", ""),
-                        ":last_login": now_iso
+                        ":name": user_data["name"],
+                        ":picture": user_data["picture"],
+                        ":last_login": user_data["last_login"]
                     }
                 )
-                # Merge new data into user_record for response
-                user_record.update({
-                    "name": userinfo.get("name", ""),
-                    "picture": userinfo.get("picture", ""),
-                    "last_login": now_iso
-                })
+                user_data = {**response["Item"], **user_data}
                 logger.info(f"Existing user updated: {email}")
-            except Exception as e:
-                logger.error(f"DynamoDB update failed: {e}")
-                return jsonify({'error': 'Database operation failed'}), 500
-        else:
-            # New user: create record with generated UserID
-            user_id = str(uuid.uuid4())
-            user_record = {
-                "UserID": user_id,
-                "Email": email,
-                "name": userinfo.get("name", ""),
-                "picture": userinfo.get("picture", ""),
-                "created_at": now_iso,
-                "last_login": now_iso
-            }
-            try:
-                users_table.put_item(Item=user_record)
-                logger.info(f"New user created: {email} with UserID: {user_id}")
-            except Exception as e:
-                logger.error(f"DynamoDB put_item failed: {e}")
-                return jsonify({'error': 'Database operation failed'}), 500
+        except Exception as e:
+            logger.error(f"DynamoDB operation failed: {e}")
+            return jsonify({'error': 'Database operation failed'}), 500
         
-        # Generate a JWT token with the user_id
+        # Generate a JWT token.
         try:
             exp_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=JWT_EXPIRATION_HOURS)
             payload = {
-                'user_id': user_id,
+                'user': email,
                 'exp': exp_time
             }
             token = jwt.encode(payload, app.secret_key, algorithm='HS256')
             return jsonify({
                 'token': token,
-                'user': user_record,
+                'user': user_data,
                 'expires': exp_time.isoformat()
             })
         except Exception as e:
@@ -241,7 +214,7 @@ def get_user(current_user):
 @token_required
 def logout(current_user):
     """Log out the user (for future expansion)."""
-    logger.info(f"User logged out: {current_user['Email']}")
+    logger.info(f"User logged out: {current_user['email']}")
     return jsonify({'message': 'Successfully logged out'})
 
 @app.route("/api/dashboard")
@@ -258,106 +231,6 @@ def health_check():
     """Health check endpoint."""
     return jsonify({'status': 'healthy'})
 
-# ----- API endpoints for Groups -----
-@app.route("/api/groups", methods=["POST"])
-@token_required
-def create_group(current_user):
-    """Create a new group."""
-    try:
-        data = request.get_json()
-        if not data or "GroupID" not in data:
-            return jsonify({'error': 'GroupID is required'}), 400
-        groups_table.put_item(Item=data)
-        return jsonify({'message': 'Group created successfully', 'group': data}), 201
-    except Exception as e:
-        logger.error(f"Error creating group: {e}")
-        return jsonify({'error': 'Failed to create group'}), 500
-
-@app.route("/api/groups/<group_id>", methods=["GET"])
-@token_required
-def get_group(current_user, group_id):
-    """Fetch group by GroupID."""
-    try:
-        response = groups_table.get_item(Key={"GroupID": group_id})
-        if "Item" not in response:
-            return jsonify({'error': 'Group not found'}), 404
-        return jsonify(response["Item"])
-    except Exception as e:
-        logger.error(f"Error fetching group: {e}")
-        return jsonify({'error': 'Failed to fetch group'}), 500
-
-# ----- API endpoints for Expenses -----
-@app.route("/api/expenses", methods=["POST"])
-@token_required
-def create_expense(current_user):
-    """Create a new expense."""
-    try:
-        data = request.get_json()
-        if not data or "ExpenseID" not in data:
-            return jsonify({'error': 'ExpenseID is required'}), 400
-        expenses_table.put_item(Item=data)
-        return jsonify({'message': 'Expense created successfully', 'expense': data}), 201
-    except Exception as e:
-        logger.error(f"Error creating expense: {e}")
-        return jsonify({'error': 'Failed to create expense'}), 500
-
-@app.route("/api/expenses/<expense_id>", methods=["GET"])
-@token_required
-def get_expense(current_user, expense_id):
-    """Fetch expense by ExpenseID."""
-    try:
-        response = expenses_table.get_item(Key={"ExpenseID": expense_id})
-        if "Item" not in response:
-            return jsonify({'error': 'Expense not found'}), 404
-        return jsonify(response["Item"])
-    except Exception as e:
-        logger.error(f"Error fetching expense: {e}")
-        return jsonify({'error': 'Failed to fetch expense'}), 500
-
-# ----- API endpoints for Transactions -----
-@app.route("/api/transactions", methods=["POST"])
-@token_required
-def create_transaction(current_user):
-    """Create a new transaction."""
-    try:
-        data = request.get_json()
-        if not data or "TransactionID" not in data or "GroupID" not in data:
-            return jsonify({'error': 'TransactionID and GroupID are required'}), 400
-        transactions_table.put_item(Item=data)
-        return jsonify({'message': 'Transaction created successfully', 'transaction': data}), 201
-    except Exception as e:
-        logger.error(f"Error creating transaction: {e}")
-        return jsonify({'error': 'Failed to create transaction'}), 500
-
-@app.route("/api/transactions/<transaction_id>", methods=["GET"])
-@token_required
-def get_transaction(current_user, transaction_id):
-    """Fetch transaction by TransactionID."""
-    try:
-        response = transactions_table.get_item(Key={"TransactionID": transaction_id})
-        if "Item" not in response:
-            return jsonify({'error': 'Transaction not found'}), 404
-        return jsonify(response["Item"])
-    except Exception as e:
-        logger.error(f"Error fetching transaction: {e}")
-        return jsonify({'error': 'Failed to fetch transaction'}), 500
-
-@app.route("/api/transactions/group/<group_id>", methods=["GET"])
-@token_required
-def get_transactions_by_group(current_user, group_id):
-    """Fetch transactions by GroupID using the Global Secondary Index."""
-    try:
-        response = transactions_table.query(
-            IndexName="GroupIndex",
-            KeyConditionExpression=Key("GroupID").eq(group_id)
-        )
-        items = response.get("Items", [])
-        return jsonify({'transactions': items})
-    except Exception as e:
-        logger.error(f"Error fetching transactions by group: {e}")
-        return jsonify({'error': 'Failed to fetch transactions for group'}), 500
-
-# ----- Error Handlers -----
 @app.errorhandler(404)
 def not_found(e):
     """Handle 404 errors."""
