@@ -19,16 +19,7 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
-# Updated CORS configuration to allow your frontend origin and necessary methods/headers.
-CORS(app,
-     supports_credentials=True,
-     resources={r"/*": {
-         "origins": "*",
-         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-         "allow_headers": ["Authorization", "Content-Type"]
-     }})
-
+CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
 app.secret_key = os.getenv('SECRET_KEY', os.urandom(24))
 
 # Google OAuth settings
@@ -47,45 +38,10 @@ groups_table = dynamodb.Table(os.getenv('DYNAMODB_GROUPS_TABLE', 'Groups'))
 expenses_table = dynamodb.Table(os.getenv('DYNAMODB_EXPENSES_TABLE', 'Expenses'))
 transactions_table = dynamodb.Table(os.getenv('DYNAMODB_TRANSACTIONS_TABLE', 'Transactions'))
 
-# def token_required(f):
-#     """Decorator to require a valid JWT token for protected routes."""
-#     @functools.wraps(f)
-#     def decorated(*args, **kwargs):
-#         token = None
-#         auth_header = request.headers.get('Authorization')
-#         if auth_header and auth_header.startswith('Bearer '):
-#             token = auth_header.split(' ')[1]
-#         if not token:
-#             logger.debug("Token is missing in request headers")
-#             return jsonify({'message': 'Token is missing'}), 401
-#         try:
-#             data = jwt.decode(token, app.secret_key, algorithms=['HS256'])
-#             logger.debug(f"Decoded JWT payload: {data}")
-#             response = users_table.get_item(Key={"UserID": data['user_id']})
-#             if "Item" not in response:
-#                 logger.debug("User not found in DynamoDB")
-#                 return jsonify({'message': 'User not found'}), 401
-#             current_user = response["Item"]
-#             logger.debug(f"Authenticated user: {current_user}")
-#         except jwt.ExpiredSignatureError:
-#             logger.debug("Token has expired")
-#             return jsonify({'message': 'Token has expired'}), 401
-#         except jwt.InvalidTokenError:
-#             logger.debug("Invalid token provided")
-#             return jsonify({'message': 'Invalid token'}), 401
-#         except Exception as e:
-#             logger.error(f"Error verifying token: {e}")
-#             return jsonify({'message': 'Error processing token'}), 500
-#         return f(current_user, *args, **kwargs)
-#     return decorated
-
 def token_required(f):
+    """Decorator to require a valid JWT token for protected routes."""
     @functools.wraps(f)
     def decorated(*args, **kwargs):
-        # Bypass token check for preflight requests.
-        if request.method == "OPTIONS":
-            return jsonify({}), 200
-
         token = None
         auth_header = request.headers.get('Authorization')
         if auth_header and auth_header.startswith('Bearer '):
@@ -113,7 +69,6 @@ def token_required(f):
             return jsonify({'message': 'Error processing token'}), 500
         return f(current_user, *args, **kwargs)
     return decorated
-
 
 def get_google_provider_cfg():
     """Fetch Google OpenID configuration."""
@@ -362,13 +317,10 @@ def get_all_groups(current_user):
         return jsonify({'error': 'Failed to fetch groups'}), 500
 
 # ----- API endpoints for Expenses -----
-# Add OPTIONS handling to preflight requests for CORS.
-@app.route("/api/expenses", methods=["POST", "OPTIONS"])
+@app.route("/api/expenses", methods=["POST"])
 @token_required
 def create_expense(current_user):
     """Create a new expense for a specific group."""
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
     try:
         data = request.get_json()
         logger.debug(f"Received expense data: {data}")
@@ -401,35 +353,75 @@ def create_expense(current_user):
         logger.error(f"Error creating expense: {e}")
         return jsonify({'error': 'Failed to create expense'}), 500
 
-# Add OPTIONS handling to preflight requests for fetching expenses by group.
-@app.route("/api/expenses/group/<group_id>", methods=["GET", "OPTIONS"])
+@app.route("/api/expenses/<expense_id>", methods=["GET"])
 @token_required
-def get_expenses_by_group(current_user, group_id):
-    """Fetch all expenses for a specific group id."""
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
+def get_expense(current_user, expense_id):
+    """Fetch expense by ExpenseID."""
     try:
-        logger.debug(f"Fetching expenses for group id: {group_id}")
+        logger.debug(f"Fetching expense with ExpenseID: {expense_id}")
+        response = expenses_table.get_item(Key={"ExpenseID": expense_id})
+        if "Item" not in response:
+            logger.error("Expense not found")
+            return jsonify({'error': 'Expense not found'}), 404
+        logger.info("Expense fetched successfully")
+        return jsonify(response["Item"])
+    except Exception as e:
+        logger.error(f"Error fetching expense: {e}")
+        return jsonify({'error': 'Failed to fetch expense'}), 500
+
+@app.route("/api/get/expenses", methods=["GET"])
+@token_required
+def get_all_expenses(current_user):
+    """Fetch all expenses for groups the user belongs to."""
+    try:
+        logger.debug("Fetching groups for current user")
+        groups = []
         last_evaluated_key = None
-        expenses = []
+
         while True:
             scan_kwargs = {
-                "FilterExpression": Attr("groupId").eq(group_id)
+                "FilterExpression": Attr("members").contains(current_user["UserID"])
             }
             if last_evaluated_key:
                 scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
 
-            response = expenses_table.scan(**scan_kwargs)
-            expenses.extend(response.get("Items", []))
+            response = groups_table.scan(**scan_kwargs)
+            groups.extend(response.get("Items", []))
             last_evaluated_key = response.get("LastEvaluatedKey")
             if not last_evaluated_key:
                 break
 
-        logger.info(f"Expenses fetched for group {group_id}: {expenses}")
+        logger.debug(f"Groups for user: {groups}")
+
+        group_ids = [group["GroupID"] for group in groups]
+        logger.debug(f"Extracted group IDs: {group_ids}")
+
+        if not group_ids:
+            logger.info("No groups found for user")
+            return jsonify([]), 200
+
+        expenses = []
+        for group_id in group_ids:
+            last_evaluated_key = None
+            while True:
+                scan_kwargs = {
+                    "FilterExpression": Attr("groupId").eq(group_id)
+                }
+                if last_evaluated_key:
+                    scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
+
+                response = expenses_table.scan(**scan_kwargs)
+                expenses.extend(response.get("Items", []))
+                last_evaluated_key = response.get("LastEvaluatedKey")
+                if not last_evaluated_key:
+                    break
+
+        logger.info("Expenses fetched successfully for user's groups")
         return jsonify(expenses), 200
+
     except Exception as e:
-        logger.error(f"Error fetching expenses for group {group_id}: {str(e)}")
-        return jsonify({"error": "Failed to fetch expenses for group"}), 500
+        logger.error(f"Error fetching expenses: {str(e)}")
+        return jsonify({"error": "Failed to fetch expenses"}), 500
 
 # ----- API endpoints for Transactions -----
 @app.route("/api/transactions", methods=["POST"])
