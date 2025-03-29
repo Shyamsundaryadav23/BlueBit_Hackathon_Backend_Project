@@ -395,20 +395,134 @@ def get_all_groups(current_user):
 # Debt Settlement Endpoint
 # ------------------------
 
+# @app.route("/api/groups/<group_id>/settle", methods=["POST"])
+# @token_required
+# def settle_group_debts(current_user, group_id):
+#     try:
+#         group_response = groups_table.get_item(Key={"GroupID": group_id})
+#         if "Item" not in group_response:
+#             return jsonify({"error": "Group not found"}), 404
+            
+#         group = group_response["Item"]
+#         user_email = current_user["Email"]
+#         if group["createdBy"] != user_email and not any(m.get("email") == user_email for m in group.get("members", [])):
+#             return jsonify({"error": "Unauthorized"}), 403
+
+#         # Fetch all expenses for the group
+#         expenses = []
+#         last_key = None
+#         while True:
+#             scan_args = {"FilterExpression": Attr("GroupID").eq(group_id)}
+#             if last_key:
+#                 scan_args["ExclusiveStartKey"] = last_key
+#             response = expenses_table.scan(**scan_args)
+#             expenses.extend(response.get("Items", []))
+#             last_key = response.get("LastEvaluatedKey")
+#             if not last_key:
+#                 break
+
+#         # Calculate balances for each member
+#         balances = defaultdict(Decimal)
+#         member_emails = {m["email"] for m in group.get("members", []) if m.get("email")}
+#         for email in member_emails:
+#             balances[email] = Decimal('0')
+
+#         for expense in expenses:
+#             paid_by = expense["paidBy"]
+#             for split in expense.get("splits", []):
+#                 # Handle different split formats
+#                 if "M" in split:
+#                     split_data = split["M"]
+#                     if "memberId" not in split_data or "amount" not in split_data:
+#                         continue
+#                     member_id = split_data["memberId"].get("S")
+#                     amount = Decimal(split_data["amount"].get("N", "0"))
+#                 else:
+#                     split_data = split
+#                     if "memberId" not in split_data:
+#                         continue
+#                     member_id = split_data["memberId"]
+#                     amount = Decimal(str(split_data["amount"]))
+#                 if not member_id:
+#                     continue
+#                 if member_id != paid_by:
+#                     balances[member_id] -= amount
+#                     balances[paid_by] += amount
+
+#         # Determine minimal cash flow transactions to settle debts
+#         def min_cash_flow(bal_list):
+#             if all(abs(b) < Decimal("0.01") for _, b in bal_list):
+#                 return []
+#             max_creditor = max(bal_list, key=lambda x: x[1])
+#             max_debtor = min(bal_list, key=lambda x: x[1])
+#             settle_amt = min(max_creditor[1], -max_debtor[1])
+#             txn = {
+#                 "TransactionID": str(uuid.uuid4()),
+#                 "GroupID": group_id,
+#                 "From": max_debtor[0],
+#                 "To": max_creditor[0],
+#                 "Amount": settle_amt,
+#                 "Date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+#                 "Status": "pending",
+#                 "CreatedBy": current_user["UserID"]
+#             }
+#             new_bal_list = []
+#             for email, bal in bal_list:
+#                 if email == max_creditor[0]:
+#                     new_bal_list.append((email, bal - settle_amt))
+#                 elif email == max_debtor[0]:
+#                     new_bal_list.append((email, bal + settle_amt))
+#                 else:
+#                     new_bal_list.append((email, bal))
+#             return [txn] + min_cash_flow(new_bal_list)
+
+#         balance_list = list(balances.items())
+#         transactions = min_cash_flow(balance_list)
+
+#         # Remove existing transactions for the group and add the new ones
+#         existing_txs = transactions_table.query(
+#             IndexName="GroupIndex",
+#             KeyConditionExpression=Key("GroupID").eq(group_id)
+#         )["Items"]
+#         with transactions_table.batch_writer() as batch:
+#             for tx in existing_txs:
+#                 batch.delete_item(Key={"TransactionID": tx["TransactionID"]})
+#             for tx in transactions:
+#                 batch.put_item(Item=tx)
+
+#         return jsonify({
+#             "message": "Debts settled successfully",
+#             "transactions": [{
+#                 "TransactionID": tx["TransactionID"],
+#                 "From": tx["From"],
+#                 "To": tx["To"],
+#                 "Amount": str(tx["Amount"]),
+#                 "Date": tx["Date"],
+#                 "Status": tx["Status"]
+#             } for tx in transactions]
+#         }), 200
+
+#     except Exception as e:
+#         logger.error(f"Settlement error: {str(e)}")
+#         return jsonify({"error": "Failed to settle debts"}), 500
+
+
 @app.route("/api/groups/<group_id>/settle", methods=["POST"])
 @token_required
 def settle_group_debts(current_user, group_id):
     try:
+        # Retrieve group details.
         group_response = groups_table.get_item(Key={"GroupID": group_id})
         if "Item" not in group_response:
             return jsonify({"error": "Group not found"}), 404
-            
+
         group = group_response["Item"]
         user_email = current_user["Email"]
+        # Check authorization using emails.
         if group["createdBy"] != user_email and not any(m.get("email") == user_email for m in group.get("members", [])):
             return jsonify({"error": "Unauthorized"}), 403
 
-        # Fetch all expenses for the group
+        # Fetch all expenses for the group.
         expenses = []
         last_key = None
         while True:
@@ -421,20 +535,29 @@ def settle_group_debts(current_user, group_id):
             if not last_key:
                 break
 
-        # Calculate balances for each member
+        # Initialize balances for each group member.
+        # We assume the keys are the members' emails.
         balances = defaultdict(Decimal)
         member_emails = {m["email"] for m in group.get("members", []) if m.get("email")}
         for email in member_emails:
-            balances[email] = Decimal('0')
+            balances[email] = Decimal("0")
 
+        # Process each expense.
         for expense in expenses:
-            paid_by = expense["paidBy"]
+            # Expect paidBy to be an email that is already in balances.
+            paid_by = expense.get("paidBy")
+            if not paid_by or paid_by not in balances:
+                # Skip expense if paid_by is missing or not recognized.
+                continue
+
+            # Process each split in the expense.
             for split in expense.get("splits", []):
-                # Handle different split formats
+                # Extract the split details; support both DynamoDB "M" type and plain JSON.
                 if "M" in split:
                     split_data = split["M"]
                     if "memberId" not in split_data or "amount" not in split_data:
                         continue
+                    # Assume memberId here should be the email string.
                     member_id = split_data["memberId"].get("S")
                     amount = Decimal(split_data["amount"].get("N", "0"))
                 else:
@@ -443,16 +566,26 @@ def settle_group_debts(current_user, group_id):
                         continue
                     member_id = split_data["memberId"]
                     amount = Decimal(str(split_data["amount"]))
+                
                 if not member_id:
                     continue
+
+                # Only process if the member is part of the group.
+                if member_id not in balances:
+                    continue
+
+                # If the split member is not the payer, update balances:
+                # The member owes 'amount' and the payer is credited.
                 if member_id != paid_by:
                     balances[member_id] -= amount
                     balances[paid_by] += amount
 
-        # Determine minimal cash flow transactions to settle debts
+        # Minimal Cash Flow Algorithm to settle debts.
         def min_cash_flow(bal_list):
+            # If all balances are near zero, we are done.
             if all(abs(b) < Decimal("0.01") for _, b in bal_list):
                 return []
+            # Identify the maximum creditor and maximum debtor.
             max_creditor = max(bal_list, key=lambda x: x[1])
             max_debtor = min(bal_list, key=lambda x: x[1])
             settle_amt = min(max_creditor[1], -max_debtor[1])
@@ -466,6 +599,7 @@ def settle_group_debts(current_user, group_id):
                 "Status": "pending",
                 "CreatedBy": current_user["UserID"]
             }
+            # Update balances.
             new_bal_list = []
             for email, bal in bal_list:
                 if email == max_creditor[0]:
@@ -479,7 +613,7 @@ def settle_group_debts(current_user, group_id):
         balance_list = list(balances.items())
         transactions = min_cash_flow(balance_list)
 
-        # Remove existing transactions for the group and add the new ones
+        # Remove any existing transactions for the group and store the new ones.
         existing_txs = transactions_table.query(
             IndexName="GroupIndex",
             KeyConditionExpression=Key("GroupID").eq(group_id)
@@ -505,6 +639,7 @@ def settle_group_debts(current_user, group_id):
     except Exception as e:
         logger.error(f"Settlement error: {str(e)}")
         return jsonify({"error": "Failed to settle debts"}), 500
+
 
 # ------------------------
 # Expenses Endpoints
