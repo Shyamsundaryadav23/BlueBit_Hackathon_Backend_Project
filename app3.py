@@ -12,18 +12,18 @@ import boto3
 from boto3.dynamodb.conditions import Key, Attr
 import base64
 from decimal import Decimal
-from collections import defaultdict
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Configure logging: Set to DEBUG for detailed logs if needed.
+# logging.basicConfig(level=logging.DEBUG)
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# CORS configuration
+# Updated CORS configuration to allow your frontend origin and necessary methods/headers.
 CORS(app,
      supports_credentials=True,
      resources={r"/*": {
@@ -44,27 +44,16 @@ JWT_EXPIRATION_HOURS = int(os.getenv('JWT_EXPIRATION_HOURS', '24'))
 AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
 dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
 
-# Tables
+# Tables (using defaults if not specified in .env)
 users_table = dynamodb.Table(os.getenv('DYNAMODB_USERS_TABLE', 'Users'))
 groups_table = dynamodb.Table(os.getenv('DYNAMODB_GROUPS_TABLE', 'Groups'))
 expenses_table = dynamodb.Table(os.getenv('DYNAMODB_EXPENSES_TABLE', 'Expenses'))
 transactions_table = dynamodb.Table(os.getenv('DYNAMODB_TRANSACTIONS_TABLE', 'Transactions'))
 
-# Helper function: recursively convert floats to Decimals
-def convert_to_decimal(obj):
-    if isinstance(obj, float):
-        return Decimal(str(obj))
-    elif isinstance(obj, list):
-        return [convert_to_decimal(item) for item in obj]
-    elif isinstance(obj, dict):
-        return {key: convert_to_decimal(value) for key, value in obj.items()}
-    else:
-        return obj
-
-# Token validation decorator
 def token_required(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
+        # Bypass token check for preflight requests.
         if request.method == "OPTIONS":
             return jsonify({}), 200
 
@@ -73,37 +62,43 @@ def token_required(f):
         if auth_header and auth_header.startswith('Bearer '):
             token = auth_header.split(' ')[1]
         if not token:
+            logger.debug("Token is missing in request headers")
             return jsonify({'message': 'Token is missing'}), 401
         try:
             data = jwt.decode(token, app.secret_key, algorithms=['HS256'])
+            logger.debug(f"Decoded JWT payload: {data}")
             response = users_table.get_item(Key={"UserID": data['user_id']})
             if "Item" not in response:
+                logger.debug("User not found in DynamoDB")
                 return jsonify({'message': 'User not found'}), 401
             current_user = response["Item"]
+            logger.debug(f"Authenticated user: {current_user}")
         except jwt.ExpiredSignatureError:
+            logger.debug("Token has expired")
             return jsonify({'message': 'Token has expired'}), 401
         except jwt.InvalidTokenError:
+            logger.debug("Invalid token provided")
             return jsonify({'message': 'Invalid token'}), 401
         except Exception as e:
-            logger.error(f"Token error: {e}")
+            logger.error(f"Error verifying token: {e}")
             return jsonify({'message': 'Error processing token'}), 500
         return f(current_user, *args, **kwargs)
     return decorated
 
-# ------------------------
-# Google OAuth & User Routes
-# ------------------------
-
+# email verification
 @app.route("/api/verify-email", methods=["POST"])
 def verify_email():
     data = request.json
     token = data.get("token")
+
     if not token:
         return jsonify({"success": False, "error": "No token provided"}), 400
+
     try:
         email = base64.b64decode(token).decode()
     except:
         return jsonify({"success": False, "error": "Invalid token"}), 400
+
     try:
         response = users_table.update_item(
             Key={"email": email},
@@ -116,6 +111,7 @@ def verify_email():
         return jsonify({"success": False, "error": str(e)}), 500
 
 def get_google_provider_cfg():
+    """Fetch Google OpenID configuration."""
     try:
         cfg = requests.get(GOOGLE_DISCOVERY_URL).json()
         logger.debug("Fetched Google provider configuration successfully")
@@ -126,6 +122,7 @@ def get_google_provider_cfg():
 
 @app.route("/api/login")
 def login():
+    """Initiate Google OAuth flow using the frontend callback URL."""
     try:
         google_cfg = get_google_provider_cfg()
         if not google_cfg:
@@ -157,6 +154,7 @@ def login():
 
 @app.route("/api/callback")
 def callback():
+    """Handle OAuth callback from Google: exchange code, update DynamoDB, and generate a JWT."""
     try:
         code = request.args.get("code")
         if not code:
@@ -182,6 +180,7 @@ def callback():
                 "grant_type": "authorization_code"
             }
         )
+        
         if not token_response.ok:
             logger.error(f"Token exchange failed: {token_response.text}")
             return jsonify({'error': 'Failed to retrieve token from Google'}), 400
@@ -195,6 +194,7 @@ def callback():
             userinfo_endpoint,
             headers={"Authorization": f"Bearer {access_token}"}
         )
+        
         if not userinfo_response.ok:
             logger.error(f"User info fetch failed: {userinfo_response.text}")
             return jsonify({'error': 'Failed to retrieve user information'}), 400
@@ -271,6 +271,7 @@ def callback():
         except Exception as e:
             logger.error(f"Token generation failed: {e}")
             return jsonify({'error': 'Authentication failed'}), 500
+            
     except Exception as e:
         logger.error(f"Callback error: {e}")
         return jsonify({'error': 'Authentication process failed'}), 500
@@ -278,40 +279,43 @@ def callback():
 @app.route("/api/user", methods=["GET"])
 @token_required
 def get_user(current_user):
+    """Return the current user profile."""
     logger.debug("Returning current user profile")
     return jsonify(current_user)
 
 @app.route("/api/logout", methods=["POST"])
 @token_required
 def logout(current_user):
+    """Log out the user (for future expansion)."""
     logger.info(f"User logged out: {current_user['Email']}")
     return jsonify({'message': 'Successfully logged out'})
 
 @app.route("/api/dashboard")
 @token_required
 def dashboard(current_user):
+    """Protected dashboard route example."""
     logger.debug("Dashboard accessed by user")
     return jsonify({
         'message': 'You have access to the dashboard',
         'user': current_user
     })
 
-# ------------------------
-# Groups Endpoints
-# ------------------------
-
+# ----- API endpoints for Groups -----
 @app.route("/api/groups", methods=["POST"])
 @token_required
 def create_group(current_user):
+    """Create a new group, automatically associating it with the current user."""
     try:
         data = request.get_json()
         if not data or "name" not in data:
             logger.error("Group name is required")
             return jsonify({'error': 'Group name is required'}), 400
         
+        # Generate a unique GroupID and record creation timestamp
         group_id = str(uuid.uuid4())
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         
+        # Create the group with current user as creator and add them to members
         group_data = {
             "GroupID": group_id,
             "name": data.get("name"),
@@ -319,6 +323,7 @@ def create_group(current_user):
             "members": data.get("members", []),
             "createdAt": now_iso
         }
+        # Ensure current user is included in the members list
         if not any(member.get("email") == current_user.get("Email") for member in group_data["members"]):
             group_data["members"].append({"email": current_user.get("Email")})
         
@@ -332,6 +337,7 @@ def create_group(current_user):
 @app.route("/api/groups/<group_id>", methods=["GET"])
 @token_required
 def get_group(current_user, group_id):
+    """Fetch group by GroupID only if current user is the creator or a member."""
     try:
         logger.debug(f"Fetching group with GroupID: {group_id}")
         response = groups_table.get_item(Key={"GroupID": group_id})
@@ -341,6 +347,7 @@ def get_group(current_user, group_id):
         
         group = response["Item"]
         user_email = current_user.get("Email")
+        # Check if user is creator or member
         if group.get("createdBy") != user_email and not any(member.get("email") == user_email for member in group.get("members", [])):
             logger.error("User not authorized to view this group")
             return jsonify({'error': 'Not authorized to view this group'}), 403
@@ -354,15 +361,28 @@ def get_group(current_user, group_id):
 @app.route("/api/groups", methods=["GET"])
 @token_required
 def get_all_groups(current_user):
+    """
+    Fetch all groups for which the current user is either the creator or a member.
+    """
     try:
         logger.debug("Scanning all groups from DynamoDB")
         response = groups_table.scan()
         all_groups = response.get('Items', [])
         
         user_email = current_user.get('Email')
+        
         filtered_groups = []
         for group in all_groups:
-            if group.get('createdBy') == user_email or any(member.get('email') == user_email for member in group.get('members', [])):
+            created_by = group.get('createdBy')
+            members = group.get('members', [])
+            
+            # Include if current user created the group
+            if created_by == user_email:
+                filtered_groups.append(group)
+                continue
+            
+            # Include if current user is a member
+            if any(member.get('email') == user_email for member in members):
                 filtered_groups.append(group)
         
         if not filtered_groups:
@@ -371,177 +391,96 @@ def get_all_groups(current_user):
         
         logger.info("Groups retrieved successfully for this user")
         return jsonify(filtered_groups), 200
+
     except Exception as e:
         logger.error(f"Error fetching groups: {e}")
         return jsonify({'error': 'Failed to fetch groups'}), 500
 
-# Debt Settlement Endpoint
-@app.route("/api/groups/<group_id>/settle", methods=["POST"])
-@token_required
-def settle_group_debts(current_user, group_id):
-    try:
-        group_response = groups_table.get_item(Key={"GroupID": group_id})
-        if "Item" not in group_response:
-            return jsonify({"error": "Group not found"}), 404
-            
-        group = group_response["Item"]
-        user_email = current_user["Email"]
-        if group["createdBy"] != user_email and not any(m["email"] == user_email for m in group["members"]):
-            return jsonify({"error": "Unauthorized"}), 403
+# ----- API endpoints for Expenses -----
 
-        expenses = []
-        last_key = None
-        while True:
-            scan_args = {"FilterExpression": Attr("GroupID").eq(group_id)}
-            if last_key:
-                scan_args["ExclusiveStartKey"] = last_key
-            response = expenses_table.scan(**scan_args)
-            expenses.extend(response.get("Items", []))
-            last_key = response.get("LastEvaluatedKey")
-            if not last_key:
-                break
-
-        balances = defaultdict(Decimal)
-        members = {m["email"] for m in group["members"]}
-        for email in members:
-            balances[email] = Decimal('0')
-
-        for expense in expenses:
-            paid_by = expense["paidBy"]
-            for split in expense.get("splits", []):
-                member_email = split["memberId"]
-                amount = Decimal(str(split["amount"]))
-                if member_email != paid_by:
-                    balances[member_email] -= amount
-                    balances[paid_by] += amount
-
-        creditors = []
-        debtors = []
-        for email, balance in balances.items():
-            if balance > Decimal('0'):
-                creditors.append((email, balance))
-            elif balance < Decimal('0'):
-                debtors.append((email, -balance))
-        
-        creditors.sort(key=lambda x: -x[1])
-        debtors.sort(key=lambda x: -x[1])
-        transactions = []
-        while creditors and debtors:
-            (creditor, c_amt) = creditors[0]
-            (debtor, d_amt) = debtors[0]
-            settle_amt = min(c_amt, d_amt)
-            transaction = {
-                "TransactionID": str(uuid.uuid4()),
-                "GroupID": group_id,
-                "From": debtor,
-                "To": creditor,
-                "Amount": settle_amt,
-                "Date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "Status": "pending",
-                "CreatedBy": current_user["UserID"]
-            }
-            transactions.append(transaction)
-            if c_amt == settle_amt:
-                creditors.pop(0)
-            else:
-                creditors[0] = (creditor, c_amt - settle_amt)
-                creditors.sort(key=lambda x: -x[1])
-            if d_amt == settle_amt:
-                debtors.pop(0)
-            else:
-                debtors[0] = (debtor, d_amt - settle_amt)
-                debtors.sort(key=lambda x: -x[1])
-        
-        existing_txs = transactions_table.query(
-            IndexName="GroupIndex",
-            KeyConditionExpression=Key("GroupID").eq(group_id)
-        )["Items"]
-
-        with transactions_table.batch_writer() as batch:
-            for tx in existing_txs:
-                batch.delete_item(Key={"TransactionID": tx["TransactionID"]})
-            for tx in transactions:
-                batch.put_item(Item=tx)
-
-        return jsonify({
-            "message": "Debts settled successfully",
-            "transactions": [{
-                "TransactionID": tx["TransactionID"],
-                "From": tx["From"],
-                "To": tx["To"],
-                "Amount": str(tx["Amount"]),
-                "Date": tx["Date"],
-                "Status": tx["Status"]
-            } for tx in transactions]
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Settlement error: {str(e)}")
-        return jsonify({"error": "Failed to settle debts"}), 500
-
-# ------------------------
-# Expenses Endpoints
-# ------------------------
-
+# Helper function: recursively convert floats to Decimals
+def convert_to_decimal(obj):
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    elif isinstance(obj, list):
+        return [convert_to_decimal(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_to_decimal(value) for key, value in obj.items()}
+    else:
+        return obj
+    
 @app.route("/api/expenses", methods=["POST", "OPTIONS"])
 @token_required
 def create_expense(current_user):
+    """Create a new expense for a specific group, only if the user is authorized."""
     if request.method == "OPTIONS":
         return jsonify({}), 200
-        
     try:
         data = request.get_json()
+        logger.debug(f"Received expense data: {data}")
+        # Accept either "groupId" or "GroupID" from the request
         group_id = data.get("groupId") or data.get("GroupID")
-        if not data or not group_id:
-            return jsonify({'error': 'Invalid request'}), 400
+        if not data or "ExpenseID" not in data or not group_id:
+            logger.error("ExpenseID or groupId missing in request")
+            return jsonify({'error': 'ExpenseID and groupId are required'}), 400
 
-        group = groups_table.get_item(Key={"GroupID": group_id}).get("Item")
-        if not group:
+        # Validate group and user membership
+        group_response = groups_table.get_item(Key={"GroupID": group_id})
+        if "Item" not in group_response:
+            logger.error("Group not found for provided groupId")
             return jsonify({'error': 'Group not found'}), 404
-            
-        user_email = current_user["Email"]
-        if group["createdBy"] != user_email and not any(m["email"] == user_email for m in group["members"]):
-            return jsonify({'error': 'Unauthorized'}), 403
 
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        data.update({
-            "createdBy": current_user["UserID"],
-            "paidBy": user_email,
-            "createdAt": now,
-            "updatedAt": now,
-            "GroupID": group_id
-        })
+        group_item = group_response["Item"]
+        user_email = current_user.get("Email")
+        if group_item.get("createdBy") != user_email and not any(member.get("email") == user_email for member in group_item.get("members", [])):
+            logger.error("User not authorized to add expense to this group")
+            return jsonify({'error': 'User not authorized for this group'}), 403
 
-        if "amount" in data:
-            data["amount"] = Decimal(str(data["amount"]))
-        if "splits" in data:
-            for split in data["splits"]:
-                split["amount"] = Decimal(str(split["amount"]))
+        # Add a createdAt timestamp if not provided
+        if "createdAt" not in data:
+            data["createdAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            logger.debug("Added createdAt timestamp to expense data")
 
-        expenses_table.put_item(Item=data)
-        return jsonify({'message': 'Expense created', 'expense': data}), 201
+        # Ensure consistent attribute for the group ID
+        data["GroupID"] = group_id
 
+        # Convert any float values in the data to Decimal
+        converted_data = convert_to_decimal(data)
+
+        # Remove ConditionExpression to allow overwriting duplicates (or you can implement a better unique ID strategy)
+        expenses_table.put_item(
+            Item=converted_data
+        )
+        logger.info("Expense created successfully")
+        return jsonify({'message': 'Expense created successfully', 'expense': data}), 201
     except Exception as e:
-        logger.error(f"Expense error: {str(e)}")
-        return jsonify({'error': 'Failed to create expense'}), 500
+        logger.error(f"Error creating expense: {repr(e)}")
+        return jsonify({'error': 'Failed to create expense', 'details': str(e)}), 500
+
 
 @app.route("/api/expenses/group/<group_id>", methods=["GET", "OPTIONS"])
 @token_required
 def get_expenses_by_group(current_user, group_id):
+    """Fetch all expenses for a specific group id, only if the current user is authorized (i.e. is the creator or a member of the group)."""
     if request.method == "OPTIONS":
         return jsonify({}), 200
     try:
+        # Retrieve group details from DynamoDB.
         group_response = groups_table.get_item(Key={"GroupID": group_id})
         if "Item" not in group_response:
             logger.error("Group not found")
             return jsonify({'error': 'Group not found'}), 404
         
-        group = group_response["Item"]
+        group_item = group_response["Item"]
+        # Use the correct key "Email" for the current user.
         user_email = current_user.get("Email")
-        if group.get("createdBy") != user_email and not any(member.get("email") == user_email for member in group.get("members", [])):
+        
+        # Check if the current user is the creator or a member of the group.
+        if group_item.get("createdBy") != user_email and not any(member.get("email") == user_email for member in group_item.get("members", [])):
             logger.error("User not authorized to view expenses for this group")
             return jsonify({'error': 'User not authorized for this group'}), 403
 
+        # Now, fetch expenses that belong to this group.
         last_evaluated_key = None
         expenses = []
         while True:
@@ -550,6 +489,7 @@ def get_expenses_by_group(current_user, group_id):
             }
             if last_evaluated_key:
                 scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
+
             response = expenses_table.scan(**scan_kwargs)
             expenses.extend(response.get("Items", []))
             last_evaluated_key = response.get("LastEvaluatedKey")
@@ -562,33 +502,28 @@ def get_expenses_by_group(current_user, group_id):
         logger.error(f"Error fetching expenses for group {group_id}: {str(e)}")
         return jsonify({"error": "Failed to fetch expenses for group"}), 500
 
-# ------------------------
-# Transactions Endpoints
-# ------------------------
-
+# ----- API endpoints for Transactions -----
 @app.route("/api/transactions", methods=["POST"])
 @token_required
 def create_transaction(current_user):
+    """Create a new transaction."""
     try:
         data = request.get_json()
+        logger.debug(f"Received transaction data: {data}")
         if not data or "TransactionID" not in data or "GroupID" not in data:
+            logger.error("TransactionID and GroupID are required for transaction creation")
             return jsonify({'error': 'TransactionID and GroupID are required'}), 400
-        
-        data["CreatedBy"] = current_user["UserID"]
-        data["Date"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        
-        if "Amount" in data:
-            data["Amount"] = Decimal(str(data["Amount"]))
-        
         transactions_table.put_item(Item=data)
-        return jsonify({'message': 'Transaction created', 'transaction': data}), 201
+        logger.info("Transaction created successfully")
+        return jsonify({'message': 'Transaction created successfully', 'transaction': data}), 201
     except Exception as e:
-        logger.error(f"Transaction error: {str(e)}")
+        logger.error(f"Error creating transaction: {e}")
         return jsonify({'error': 'Failed to create transaction'}), 500
 
 @app.route("/api/transactions/<transaction_id>", methods=["GET"])
 @token_required
 def get_transaction(current_user, transaction_id):
+    """Fetch transaction by TransactionID."""
     try:
         logger.debug(f"Fetching transaction with TransactionID: {transaction_id}")
         response = transactions_table.get_item(Key={"TransactionID": transaction_id})
@@ -604,6 +539,7 @@ def get_transaction(current_user, transaction_id):
 @app.route("/api/transactions/group/<group_id>", methods=["GET"])
 @token_required
 def get_transactions_by_group(current_user, group_id):
+    """Fetch transactions by GroupID using the Global Secondary Index."""
     try:
         logger.debug(f"Fetching transactions for GroupID: {group_id}")
         response = transactions_table.query(
@@ -617,10 +553,7 @@ def get_transactions_by_group(current_user, group_id):
         logger.error(f"Error fetching transactions by group: {e}")
         return jsonify({'error': 'Failed to fetch transactions for group'}), 500
 
-# ------------------------
-# Error Handlers
-# ------------------------
-
+# ----- Error Handlers -----
 @app.errorhandler(404)
 def not_found(e):
     logger.error("404 Not Found: Resource not found")
@@ -632,5 +565,8 @@ def server_error(e):
     return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == "__main__":
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        logger.warning("Google OAuth credentials not set in environment variables")
     port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_ENV") == "development")
+    debug = os.getenv("FLASK_ENV") == "development"
+    app.run(host="0.0.0.0", port=port, debug=debug)
