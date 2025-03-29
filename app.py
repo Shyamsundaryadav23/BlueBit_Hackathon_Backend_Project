@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
 import base64
+from decimal import Decimal
 
 # Load environment variables
 load_dotenv()
@@ -396,6 +397,19 @@ def get_all_groups(current_user):
         return jsonify({'error': 'Failed to fetch groups'}), 500
 
 # ----- API endpoints for Expenses -----
+
+# Helper function: recursively convert floats to Decimals
+def convert_to_decimal(obj):
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    elif isinstance(obj, list):
+        return [convert_to_decimal(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_to_decimal(value) for key, value in obj.items()}
+    else:
+        return obj
+    
+
 @app.route("/api/expenses", methods=["POST", "OPTIONS"])
 @token_required
 def create_expense(current_user):
@@ -405,12 +419,14 @@ def create_expense(current_user):
     try:
         data = request.get_json()
         logger.debug(f"Received expense data: {data}")
-        if not data or "ExpenseID" not in data or "groupId" not in data:
+        # Accept either "groupId" or "GroupID" from the request
+        group_id = data.get("groupId") or data.get("GroupID")
+        if not data or "ExpenseID" not in data or not group_id:
             logger.error("ExpenseID or groupId missing in request")
             return jsonify({'error': 'ExpenseID and groupId are required'}), 400
 
         # Validate group and user membership
-        group_response = groups_table.get_item(Key={"GroupID": data["groupId"]})
+        group_response = groups_table.get_item(Key={"GroupID": group_id})
         if "Item" not in group_response:
             logger.error("Group not found for provided groupId")
             return jsonify({'error': 'Group not found'}), 404
@@ -421,16 +437,29 @@ def create_expense(current_user):
             logger.error("User not authorized to add expense to this group")
             return jsonify({'error': 'User not authorized for this group'}), 403
 
+        # Add a createdAt timestamp if not provided
         if "createdAt" not in data:
             data["createdAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             logger.debug("Added createdAt timestamp to expense data")
 
-        expenses_table.put_item(Item=data)
+        # Ensure consistent attribute for the group ID
+        data["GroupID"] = group_id
+
+        # Convert any float values in the data to Decimal
+        converted_data = convert_to_decimal(data)
+
+        # Use a ConditionExpression to ensure ExpenseID uniqueness (optional)
+        expenses_table.put_item(
+            Item=converted_data,
+            ConditionExpression="attribute_not_exists(ExpenseID)"
+        )
         logger.info("Expense created successfully")
         return jsonify({'message': 'Expense created successfully', 'expense': data}), 201
     except Exception as e:
-        logger.error(f"Error creating expense: {e}")
-        return jsonify({'error': 'Failed to create expense'}), 500
+        logger.error(f"Error creating expense: {repr(e)}")
+        return jsonify({'error': 'Failed to create expense', 'details': str(e)}), 500
+
+
 @app.route("/api/expenses/group/<group_id>", methods=["GET", "OPTIONS"])
 @token_required
 def get_expenses_by_group(current_user, group_id):
@@ -445,8 +474,8 @@ def get_expenses_by_group(current_user, group_id):
             return jsonify({'error': 'Group not found'}), 404
         
         group_item = group_response["Item"]
-        # Use the lowercase 'email' as defined in your User interface.
-        user_email = current_user.get("email")
+        # Use the correct key "Email" for the current user.
+        user_email = current_user.get("Email")
         
         # Check if the current user is the creator or a member of the group.
         if group_item.get("createdBy") != user_email and not any(member.get("email") == user_email for member in group_item.get("members", [])):
@@ -458,7 +487,7 @@ def get_expenses_by_group(current_user, group_id):
         expenses = []
         while True:
             scan_kwargs = {
-                "FilterExpression": Attr("groupId").eq(group_id)
+                "FilterExpression": Attr("GroupID").eq(group_id)
             }
             if last_evaluated_key:
                 scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
@@ -474,7 +503,6 @@ def get_expenses_by_group(current_user, group_id):
     except Exception as e:
         logger.error(f"Error fetching expenses for group {group_id}: {str(e)}")
         return jsonify({"error": "Failed to fetch expenses for group"}), 500
-
 
 # ----- API endpoints for Transactions -----
 @app.route("/api/transactions", methods=["POST"])
