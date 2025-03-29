@@ -386,7 +386,7 @@ def settle_group_debts(current_user, group_id):
             
         group = group_response["Item"]
         user_email = current_user["Email"]
-        if group["createdBy"] != user_email and not any(m["email"] == user_email for m in group["members"]):
+        if group["createdBy"] != user_email and not any(m.get("email") == user_email for m in group.get("members", [])):
             return jsonify({"error": "Unauthorized"}), 403
 
         expenses = []
@@ -402,17 +402,32 @@ def settle_group_debts(current_user, group_id):
                 break
 
         balances = defaultdict(Decimal)
-        members = {m["email"] for m in group["members"]}
+        # Only include members with valid email
+        members = {m["email"] for m in group.get("members", []) if m.get("email")}
         for email in members:
             balances[email] = Decimal('0')
 
         for expense in expenses:
             paid_by = expense["paidBy"]
             for split in expense.get("splits", []):
-                member_email = split["memberId"]
-                amount = Decimal(str(split["amount"]))
-                if member_email != paid_by:
-                    balances[member_email] -= amount
+                # Check if the split is in DynamoDB format with a "M" key.
+                if "M" in split:
+                    split_data = split["M"]
+                    # Extract memberId and amount from DynamoDB structure.
+                    if "memberId" not in split_data or "amount" not in split_data:
+                        continue
+                    member_id = split_data["memberId"]["S"] if "S" in split_data["memberId"] else None
+                    amount = Decimal(split_data["amount"]["N"]) if "N" in split_data["amount"] else Decimal("0")
+                else:
+                    split_data = split
+                    if "memberId" not in split_data:
+                        continue
+                    member_id = split_data["memberId"]
+                    amount = Decimal(str(split_data["amount"]))
+                if not member_id:
+                    continue
+                if member_id != paid_by:
+                    balances[member_id] -= amount
                     balances[paid_by] += amount
 
         creditors = []
