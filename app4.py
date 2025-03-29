@@ -1,6 +1,3 @@
-import eventlet
-eventlet.monkey_patch()
-
 import uuid
 import datetime
 import functools
@@ -16,7 +13,6 @@ from boto3.dynamodb.conditions import Key, Attr
 import base64
 from decimal import Decimal
 from collections import defaultdict
-from flask_socketio import SocketIO, join_room, leave_room, emit
 
 # Load environment variables
 load_dotenv()
@@ -38,9 +34,6 @@ CORS(app,
 
 app.secret_key = os.getenv('SECRET_KEY', os.urandom(24))
 
-# Initialize SocketIO for real-time chat with Eventlet
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
-
 # Google OAuth settings
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID')
 GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET')
@@ -51,14 +44,13 @@ JWT_EXPIRATION_HOURS = int(os.getenv('JWT_EXPIRATION_HOURS', '24'))
 AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
 dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
 
-# Tables (using environment variables with fallback defaults)
+# Tables
 users_table = dynamodb.Table(os.getenv('DYNAMODB_USERS_TABLE', 'Users'))
 groups_table = dynamodb.Table(os.getenv('DYNAMODB_GROUPS_TABLE', 'Groups'))
 expenses_table = dynamodb.Table(os.getenv('DYNAMODB_EXPENSES_TABLE', 'Expenses'))
 transactions_table = dynamodb.Table(os.getenv('DYNAMODB_TRANSACTIONS_TABLE', 'Transactions'))
-chats_table = dynamodb.Table(os.getenv('DYNAMODB_CHATS_TABLE', 'Chats'))
 
-# Helper function: recursively convert floats to Decimals (if needed)
+# Helper function: recursively convert floats to Decimals
 def convert_to_decimal(obj):
     if isinstance(obj, float):
         return Decimal(str(obj))
@@ -110,25 +102,17 @@ def verify_email():
         return jsonify({"success": False, "error": "No token provided"}), 400
     try:
         email = base64.b64decode(token).decode()
-    except Exception as e:
+    except:
         return jsonify({"success": False, "error": "Invalid token"}), 400
     try:
-        response = users_table.query(
-            IndexName="EmailIndex",
-            KeyConditionExpression=Key("Email").eq(email)
-        )
-        if not response.get("Items"):
-            return jsonify({"success": False, "error": "User not found"}), 404
-        user = response["Items"][0]
-        users_table.update_item(
-            Key={"UserID": user["UserID"]},
+        response = users_table.update_item(
+            Key={"email": email},
             UpdateExpression="SET verified = :val",
             ExpressionAttributeValues={":val": True},
             ReturnValues="UPDATED_NEW"
         )
         return jsonify({"success": True, "message": "Email verified successfully!"})
     except Exception as e:
-        logger.error(f"verify_email error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 def get_google_provider_cfg():
@@ -391,14 +375,12 @@ def get_all_groups(current_user):
         logger.error(f"Error fetching groups: {e}")
         return jsonify({'error': 'Failed to fetch groups'}), 500
 
-# ------------------------
 # Debt Settlement Endpoint
-# ------------------------
-
 @app.route("/api/groups/<group_id>/settle", methods=["POST"])
 @token_required
 def settle_group_debts(current_user, group_id):
     try:
+        # Fetch group details and check authorization
         group_response = groups_table.get_item(Key={"GroupID": group_id})
         if "Item" not in group_response:
             return jsonify({"error": "Group not found"}), 404
@@ -421,16 +403,20 @@ def settle_group_debts(current_user, group_id):
             if not last_key:
                 break
 
-        # Calculate balances for each member
+        # Compute net balance for each member.
+        # Positive balance: member should receive money.
+        # Negative balance: member should pay money.
         balances = defaultdict(Decimal)
+        # Consider only members with valid email.
         member_emails = {m["email"] for m in group.get("members", []) if m.get("email")}
         for email in member_emails:
             balances[email] = Decimal('0')
 
         for expense in expenses:
             paid_by = expense["paidBy"]
+            # For each split, deduct from the participant and add to the payer.
             for split in expense.get("splits", []):
-                # Handle different split formats
+                # Unwrap DynamoDB format if needed.
                 if "M" in split:
                     split_data = split["M"]
                     if "memberId" not in split_data or "amount" not in split_data:
@@ -445,17 +431,22 @@ def settle_group_debts(current_user, group_id):
                     amount = Decimal(str(split_data["amount"]))
                 if not member_id:
                     continue
+                # If the participant is not the payer, update net balances.
                 if member_id != paid_by:
                     balances[member_id] -= amount
                     balances[paid_by] += amount
 
-        # Determine minimal cash flow transactions to settle debts
+        # Define a recursive function to minimize cash flow.
         def min_cash_flow(bal_list):
+            # Base condition: if all balances are effectively zero, return empty list.
             if all(abs(b) < Decimal("0.01") for _, b in bal_list):
                 return []
+            # Find maximum creditor and maximum debtor.
             max_creditor = max(bal_list, key=lambda x: x[1])
             max_debtor = min(bal_list, key=lambda x: x[1])
+            # Settle amount is the minimum of what the creditor is owed and what the debtor owes.
             settle_amt = min(max_creditor[1], -max_debtor[1])
+            # Prepare a transaction: debtor pays settle_amt to creditor.
             txn = {
                 "TransactionID": str(uuid.uuid4()),
                 "GroupID": group_id,
@@ -466,6 +457,7 @@ def settle_group_debts(current_user, group_id):
                 "Status": "pending",
                 "CreatedBy": current_user["UserID"]
             }
+            # Update balances.
             new_bal_list = []
             for email, bal in bal_list:
                 if email == max_creditor[0]:
@@ -474,12 +466,14 @@ def settle_group_debts(current_user, group_id):
                     new_bal_list.append((email, bal + settle_amt))
                 else:
                     new_bal_list.append((email, bal))
+            # Recursively settle remaining amounts.
             return [txn] + min_cash_flow(new_bal_list)
 
+        # Convert the balances dict into a list of tuples.
         balance_list = list(balances.items())
         transactions = min_cash_flow(balance_list)
 
-        # Remove existing transactions for the group and add the new ones
+        # Clear any existing transactions for this group.
         existing_txs = transactions_table.query(
             IndexName="GroupIndex",
             KeyConditionExpression=Key("GroupID").eq(group_id)
@@ -505,6 +499,7 @@ def settle_group_debts(current_user, group_id):
     except Exception as e:
         logger.error(f"Settlement error: {str(e)}")
         return jsonify({"error": "Failed to settle debts"}), 500
+
 
 # ------------------------
 # Expenses Endpoints
@@ -551,6 +546,72 @@ def create_expense(current_user):
     except Exception as e:
         logger.error(f"Expense error: {str(e)}")
         return jsonify({'error': 'Failed to create expense'}), 500
+
+
+# @app.route("/api/expenses", methods=["POST", "OPTIONS"])
+# @token_required
+# def create_expense(current_user):
+#     if request.method == "OPTIONS":
+#         return jsonify({}), 200
+        
+#     try:
+#         data = request.get_json()
+#         group_id = data.get("groupId") or data.get("GroupID")
+#         if not data or not group_id:
+#             return jsonify({'error': 'Invalid request'}), 400
+
+#         group = groups_table.get_item(Key={"GroupID": group_id}).get("Item")
+#         if not group:
+#             return jsonify({'error': 'Group not found'}), 404
+            
+#         user_email = current_user.get("Email")
+#         if not user_email:
+#             return jsonify({'error': 'Current user email not found'}), 400
+
+#         # Check authorization: current user's email must be in group's members or be the creator.
+#         if group["createdBy"] != user_email and not any(m.get("email") == user_email for m in group.get("members", [])):
+#             return jsonify({'error': 'Unauthorized'}), 403
+
+#         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+#         data.update({
+#             "createdBy": current_user["UserID"],
+#             "paidBy": user_email,  # You may later want to store the userID instead
+#             "createdAt": now,
+#             "updatedAt": now,
+#             "GroupID": group_id
+#         })
+
+#         # Convert amount and update splits to use the actual UserID from Users table.
+#         if "amount" in data:
+#             data["amount"] = Decimal(str(data["amount"]))
+#         if "splits" in data:
+#             for split in data["splits"]:
+#                 # We assume split["memberId"] is an email.
+#                 member_email = split.get("memberId")
+#                 if not member_email:
+#                     # Skip or handle missing email as needed.
+#                     logger.error("Split entry missing member email.")
+#                     split["memberId"] = ""
+#                     continue
+#                 # Query Users table via the EmailIndex
+#                 user_query = users_table.query(
+#                     IndexName="EmailIndex",
+#                     KeyConditionExpression=Key("Email").eq(member_email)
+#                 )
+#                 if "Items" in user_query and len(user_query["Items"]) > 0:
+#                     split["memberId"] = user_query["Items"][0]["UserID"]
+#                 else:
+#                     logger.error(f"User with email {member_email} not found in Users table.")
+#                     split["memberId"] = ""
+#                 split["amount"] = Decimal(str(split["amount"]))
+
+#         expenses_table.put_item(Item=data)
+#         return jsonify({'message': 'Expense created', 'expense': data}), 201
+
+#     except Exception as e:
+#         logger.error(f"Expense error: {str(e)}")
+#         return jsonify({'error': 'Failed to create expense'}), 500
+
 
 @app.route("/api/expenses/group/<group_id>", methods=["GET", "OPTIONS"])
 @token_required
@@ -645,176 +706,6 @@ def get_transactions_by_group(current_user, group_id):
         return jsonify({'error': 'Failed to fetch transactions for group'}), 500
 
 # ------------------------
-# Chat Endpoints (WebSocket & API)
-# ------------------------
-# ------------------------
-# Chat Endpoints (WebSocket & API)
-# ------------------------
-
-# WebSocket endpoints for real-time chat
-@socketio.on('connect')
-def on_connect():
-    logger.info("Client connected via WebSocket")
-    emit("status", {"msg": "Connected to server"})
-
-@socketio.on('disconnect')
-def on_disconnect():
-    logger.info("Client disconnected from WebSocket")
-
-@socketio.on('join')
-def handle_join(data):
-    """
-    Expected data: { "groupId": "<group id>", "email": "<user email>" }
-    Join a chat room and receive chat history
-    """
-    group_id = data.get("groupId")
-    email = data.get("email")
-    
-    if not (group_id and email):
-        logger.error("Join event missing groupId or email.")
-        return
-        
-    # Join the socket.io room
-    join_room(group_id)
-    emit("status", {"msg": f"{email} has joined the chat."}, room=group_id)
-    logger.info(f"{email} joined chat room: {group_id}")
-    
-    # Send chat history to the user who just joined
-    try:
-        # Fetch chat history from DynamoDB
-        chats = []
-        last_key = None
-        
-        while True:
-            scan_kwargs = {
-                "FilterExpression": Attr("GroupID").eq(group_id)
-            }
-            if last_key:
-                scan_kwargs["ExclusiveStartKey"] = last_key
-                
-            response = chats_table.scan(**scan_kwargs)
-            chats.extend(response.get("Items", []))
-            
-            last_key = response.get("LastEvaluatedKey")
-            if not last_key:
-                break
-        
-        # Convert DynamoDB items to message format expected by frontend
-        messages = []
-        for chat in chats:
-            messages.append({
-                "sender": chat.get("Email", "unknown"),
-                "text": chat.get("Message", ""),
-                "timestamp": chat.get("Timestamp", "")
-            })
-        
-        # Sort messages by timestamp
-        sorted_messages = sorted(messages, key=lambda x: x.get("timestamp", ""))
-        
-        # Send chat history directly to the client who joined
-        emit("chat_history", {"messages": sorted_messages})
-        logger.info(f"Sent chat history ({len(sorted_messages)} messages) to {email}")
-        
-    except Exception as e:
-        logger.error(f"Error sending chat history for group {group_id}: {str(e)}")
-        emit("error", {"message": "Failed to load chat history"})
-
-@socketio.on('leave')
-def handle_leave(data):
-    """
-    Expected data: { "groupId": "<group id>", "email": "<user email>" }
-    """
-    group_id = data.get("groupId")
-    email = data.get("email")
-    if group_id and email:
-        leave_room(group_id)
-        emit("status", {"msg": f"{email} has left the chat."}, room=group_id)
-        logger.info(f"{email} left chat room: {group_id}")
-    else:
-        logger.error("Leave event missing groupId or email.")
-
-@socketio.on('message')
-def handle_message(data):
-    """
-    Expected data: { "groupId": "<group id>", "sender": "<user email>", "text": "<message text>" }
-    Broadcasts the message to all clients in the room and stores it in DynamoDB.
-    """
-    group_id = data.get("groupId")
-    email = data.get("sender") or data.get("email")
-    message_text = data.get("text") or data.get("message")
-    
-    if not (group_id and email and message_text):
-        logger.error("Message event missing data")
-        return
-
-    message_id = str(uuid.uuid4())
-    # Use a specific format for the timestamp
-    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-
-    try:
-        # Store the message in DynamoDB
-        chats_table.put_item(
-            Item={
-                "ChatID": message_id,
-                "GroupID": group_id,
-                "Email": email,
-                "Message": message_text,
-                "Timestamp": timestamp
-            }
-        )
-        logger.info(f"Stored message from {email} in group {group_id}")
-    except Exception as e:
-        logger.error(f"Failed to store chat message: {e}")
-        emit("error", {"message": "Failed to save your message"}, room=request.sid)
-        return
-
-    # Broadcast the message to all clients in the room
-    emit("new_message", {"sender": email, "text": message_text, "timestamp": timestamp}, room=group_id)
-
-# API endpoint to fetch persisted chat history from DynamoDB
-@app.route("/api/chats", methods=["GET"])
-@token_required
-def get_chats(current_user):
-    group_id = request.args.get("groupId")
-    if not group_id:
-        return jsonify({"error": "Missing groupId parameter"}), 400
-        
-    try:
-        # Fetch chat messages from DynamoDB
-        chats = []
-        last_key = None
-        
-        while True:
-            scan_kwargs = {
-                "FilterExpression": Attr("GroupID").eq(group_id)
-            }
-            if last_key:
-                scan_kwargs["ExclusiveStartKey"] = last_key
-                
-            response = chats_table.scan(**scan_kwargs)
-            chats.extend(response.get("Items", []))
-            
-            last_key = response.get("LastEvaluatedKey")
-            if not last_key:
-                break
-        
-        # Convert DynamoDB items to message format expected by frontend
-        messages = []
-        for chat in chats:
-            messages.append({
-                "sender": chat.get("Email", "unknown"),
-                "text": chat.get("Message", ""),
-                "timestamp": chat.get("Timestamp", "")
-            })
-        
-        # Sort messages by timestamp before returning
-        sorted_messages = sorted(messages, key=lambda x: x.get("timestamp", ""))
-        
-        return jsonify(sorted_messages), 200
-    except Exception as e:
-        logger.error(f"Error fetching chats for group {group_id}: {str(e)}")
-        return jsonify({"error": f"Failed to fetch chats: {str(e)}"}), 500
-# ------------------------
 # Error Handlers
 # ------------------------
 
@@ -830,4 +721,4 @@ def server_error(e):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    socketio.run(app, host="0.0.0.0", port=port, debug=os.getenv("FLASK_ENV") == "development")
+    app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_ENV") == "development")
