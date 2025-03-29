@@ -10,12 +10,14 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
+import base64
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging: Set to DEBUG for detailed logs.
-logging.basicConfig(level=logging.DEBUG)
+# Configure logging: Set to DEBUG for detailed logs if needed.
+# logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -46,38 +48,6 @@ users_table = dynamodb.Table(os.getenv('DYNAMODB_USERS_TABLE', 'Users'))
 groups_table = dynamodb.Table(os.getenv('DYNAMODB_GROUPS_TABLE', 'Groups'))
 expenses_table = dynamodb.Table(os.getenv('DYNAMODB_EXPENSES_TABLE', 'Expenses'))
 transactions_table = dynamodb.Table(os.getenv('DYNAMODB_TRANSACTIONS_TABLE', 'Transactions'))
-
-# def token_required(f):
-#     """Decorator to require a valid JWT token for protected routes."""
-#     @functools.wraps(f)
-#     def decorated(*args, **kwargs):
-#         token = None
-#         auth_header = request.headers.get('Authorization')
-#         if auth_header and auth_header.startswith('Bearer '):
-#             token = auth_header.split(' ')[1]
-#         if not token:
-#             logger.debug("Token is missing in request headers")
-#             return jsonify({'message': 'Token is missing'}), 401
-#         try:
-#             data = jwt.decode(token, app.secret_key, algorithms=['HS256'])
-#             logger.debug(f"Decoded JWT payload: {data}")
-#             response = users_table.get_item(Key={"UserID": data['user_id']})
-#             if "Item" not in response:
-#                 logger.debug("User not found in DynamoDB")
-#                 return jsonify({'message': 'User not found'}), 401
-#             current_user = response["Item"]
-#             logger.debug(f"Authenticated user: {current_user}")
-#         except jwt.ExpiredSignatureError:
-#             logger.debug("Token has expired")
-#             return jsonify({'message': 'Token has expired'}), 401
-#         except jwt.InvalidTokenError:
-#             logger.debug("Invalid token provided")
-#             return jsonify({'message': 'Invalid token'}), 401
-#         except Exception as e:
-#             logger.error(f"Error verifying token: {e}")
-#             return jsonify({'message': 'Error processing token'}), 500
-#         return f(current_user, *args, **kwargs)
-#     return decorated
 
 def token_required(f):
     @functools.wraps(f)
@@ -114,6 +84,30 @@ def token_required(f):
         return f(current_user, *args, **kwargs)
     return decorated
 
+# email verification
+@app.route("/api/verify-email", methods=["POST"])
+def verify_email():
+    data = request.json
+    token = data.get("token")
+
+    if not token:
+        return jsonify({"success": False, "error": "No token provided"}), 400
+
+    try:
+        email = base64.b64decode(token).decode()
+    except:
+        return jsonify({"success": False, "error": "Invalid token"}), 400
+
+    try:
+        response = users_table.update_item(
+            Key={"email": email},
+            UpdateExpression="SET verified = :val",
+            ExpressionAttributeValues={":val": True},
+            ReturnValues="UPDATED_NEW"
+        )
+        return jsonify({"success": True, "message": "Email verified successfully!"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 def get_google_provider_cfg():
     """Fetch Google OpenID configuration."""
@@ -305,26 +299,36 @@ def dashboard(current_user):
         'user': current_user
     })
 
-@app.route("/api/health")
-def health_check():
-    """Health check endpoint."""
-    logger.debug("Health check endpoint called")
-    return jsonify({'status': 'healthy'})
-
 # ----- API endpoints for Groups -----
 @app.route("/api/groups", methods=["POST"])
 @token_required
 def create_group(current_user):
-    """Create a new group."""
+    """Create a new group, automatically associating it with the current user."""
     try:
         data = request.get_json()
-        logger.debug(f"Received group data: {data}")
-        if not data or "GroupID" not in data:
-            logger.error("GroupID is required but not provided")
-            return jsonify({'error': 'GroupID is required'}), 400
-        groups_table.put_item(Item=data)
-        logger.info("Group created successfully")
-        return jsonify({'message': 'Group created successfully', 'group': data}), 201
+        if not data or "name" not in data:
+            logger.error("Group name is required")
+            return jsonify({'error': 'Group name is required'}), 400
+        
+        # Generate a unique GroupID and record creation timestamp
+        group_id = str(uuid.uuid4())
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        
+        # Create the group with current user as creator and add them to members
+        group_data = {
+            "GroupID": group_id,
+            "name": data.get("name"),
+            "createdBy": current_user.get("Email"),
+            "members": data.get("members", []),
+            "createdAt": now_iso
+        }
+        # Ensure current user is included in the members list
+        if not any(member.get("email") == current_user.get("Email") for member in group_data["members"]):
+            group_data["members"].append({"email": current_user.get("Email")})
+        
+        groups_table.put_item(Item=group_data)
+        logger.info(f"Group created successfully: {group_id}")
+        return jsonify({'message': 'Group created successfully', 'group': group_data}), 201
     except Exception as e:
         logger.error(f"Error creating group: {e}")
         return jsonify({'error': 'Failed to create group'}), 500
@@ -332,15 +336,23 @@ def create_group(current_user):
 @app.route("/api/groups/<group_id>", methods=["GET"])
 @token_required
 def get_group(current_user, group_id):
-    """Fetch group by GroupID."""
+    """Fetch group by GroupID only if current user is the creator or a member."""
     try:
         logger.debug(f"Fetching group with GroupID: {group_id}")
         response = groups_table.get_item(Key={"GroupID": group_id})
         if "Item" not in response:
             logger.error("Group not found")
             return jsonify({'error': 'Group not found'}), 404
+        
+        group = response["Item"]
+        user_email = current_user.get("Email")
+        # Check if user is creator or member
+        if group.get("createdBy") != user_email and not any(member.get("email") == user_email for member in group.get("members", [])):
+            logger.error("User not authorized to view this group")
+            return jsonify({'error': 'Not authorized to view this group'}), 403
+        
         logger.debug("Group found, returning group data")
-        return jsonify(response["Item"])
+        return jsonify(group)
     except Exception as e:
         logger.error(f"Error fetching group: {e}")
         return jsonify({'error': 'Failed to fetch group'}), 500
@@ -348,25 +360,46 @@ def get_group(current_user, group_id):
 @app.route("/api/groups", methods=["GET"])
 @token_required
 def get_all_groups(current_user):
-    """Fetch all groups."""
+    """
+    Fetch all groups for which the current user is either the creator or a member.
+    """
     try:
         logger.debug("Scanning all groups from DynamoDB")
         response = groups_table.scan()
-        if 'Items' not in response or len(response['Items']) == 0:
-            logger.error("No groups found")
+        all_groups = response.get('Items', [])
+        
+        user_email = current_user.get('Email')
+        
+        filtered_groups = []
+        for group in all_groups:
+            created_by = group.get('createdBy')
+            members = group.get('members', [])
+            
+            # Include if current user created the group
+            if created_by == user_email:
+                filtered_groups.append(group)
+                continue
+            
+            # Include if current user is a member
+            if any(member.get('email') == user_email for member in members):
+                filtered_groups.append(group)
+        
+        if not filtered_groups:
+            logger.error("No groups found for this user")
             return jsonify({'error': 'No groups found'}), 404
-        logger.info("Groups retrieved successfully")
-        return jsonify(response['Items']), 200
+        
+        logger.info("Groups retrieved successfully for this user")
+        return jsonify(filtered_groups), 200
+
     except Exception as e:
         logger.error(f"Error fetching groups: {e}")
         return jsonify({'error': 'Failed to fetch groups'}), 500
 
 # ----- API endpoints for Expenses -----
-# Add OPTIONS handling to preflight requests for CORS.
 @app.route("/api/expenses", methods=["POST", "OPTIONS"])
 @token_required
 def create_expense(current_user):
-    """Create a new expense for a specific group."""
+    """Create a new expense for a specific group, only if the user is authorized."""
     if request.method == "OPTIONS":
         return jsonify({}), 200
     try:
@@ -376,19 +409,17 @@ def create_expense(current_user):
             logger.error("ExpenseID or groupId missing in request")
             return jsonify({'error': 'ExpenseID and groupId are required'}), 400
 
-        logger.debug(f"Validating group with GroupID: {data['groupId']}")
+        # Validate group and user membership
         group_response = groups_table.get_item(Key={"GroupID": data["groupId"]})
         if "Item" not in group_response:
             logger.error("Group not found for provided groupId")
             return jsonify({'error': 'Group not found'}), 404
 
-        # Log emails of all members from the group (if available)
         group_item = group_response["Item"]
-        if "members" in group_item and group_item["members"]:
-            for member in group_item["members"]:
-                logger.debug(f"Group member email: {member.get('email')}")
-        else:
-            logger.debug("No members found in the group")
+        user_email = current_user.get("Email")
+        if group_item.get("createdBy") != user_email and not any(member.get("email") == user_email for member in group_item.get("members", [])):
+            logger.error("User not authorized to add expense to this group")
+            return jsonify({'error': 'User not authorized for this group'}), 403
 
         if "createdAt" not in data:
             data["createdAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -400,16 +431,29 @@ def create_expense(current_user):
     except Exception as e:
         logger.error(f"Error creating expense: {e}")
         return jsonify({'error': 'Failed to create expense'}), 500
-
-# Add OPTIONS handling to preflight requests for fetching expenses by group.
 @app.route("/api/expenses/group/<group_id>", methods=["GET", "OPTIONS"])
 @token_required
 def get_expenses_by_group(current_user, group_id):
-    """Fetch all expenses for a specific group id."""
+    """Fetch all expenses for a specific group id, only if the current user is authorized (i.e. is the creator or a member of the group)."""
     if request.method == "OPTIONS":
         return jsonify({}), 200
     try:
-        logger.debug(f"Fetching expenses for group id: {group_id}")
+        # Retrieve group details from DynamoDB.
+        group_response = groups_table.get_item(Key={"GroupID": group_id})
+        if "Item" not in group_response:
+            logger.error("Group not found")
+            return jsonify({'error': 'Group not found'}), 404
+        
+        group_item = group_response["Item"]
+        # Use the lowercase 'email' as defined in your User interface.
+        user_email = current_user.get("email")
+        
+        # Check if the current user is the creator or a member of the group.
+        if group_item.get("createdBy") != user_email and not any(member.get("email") == user_email for member in group_item.get("members", [])):
+            logger.error("User not authorized to view expenses for this group")
+            return jsonify({'error': 'User not authorized for this group'}), 403
+
+        # Now, fetch expenses that belong to this group.
         last_evaluated_key = None
         expenses = []
         while True:
@@ -430,6 +474,7 @@ def get_expenses_by_group(current_user, group_id):
     except Exception as e:
         logger.error(f"Error fetching expenses for group {group_id}: {str(e)}")
         return jsonify({"error": "Failed to fetch expenses for group"}), 500
+
 
 # ----- API endpoints for Transactions -----
 @app.route("/api/transactions", methods=["POST"])
