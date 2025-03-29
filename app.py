@@ -18,6 +18,11 @@ from decimal import Decimal
 from collections import defaultdict
 from flask_socketio import SocketIO, join_room, leave_room, emit
 
+# OCR-related imports
+import re
+from PIL import Image
+import pytesseract
+
 # Load environment variables
 load_dotenv()
 
@@ -58,6 +63,14 @@ expenses_table = dynamodb.Table(os.getenv('DYNAMODB_EXPENSES_TABLE', 'Expenses')
 transactions_table = dynamodb.Table(os.getenv('DYNAMODB_TRANSACTIONS_TABLE', 'Transactions'))
 chats_table = dynamodb.Table(os.getenv('DYNAMODB_CHATS_TABLE', 'Chats'))
 
+# OCR upload folder configuration
+UPLOAD_FOLDER = 'static/uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# Ensure upload directory exists
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
 # Helper function: recursively convert floats to Decimals (if needed)
 def convert_to_decimal(obj):
     if isinstance(obj, float):
@@ -97,6 +110,102 @@ def token_required(f):
             return jsonify({'message': 'Error processing token'}), 500
         return f(current_user, *args, **kwargs)
     return decorated
+
+# ------------------------
+# OCR Functions and Routes
+# ------------------------
+
+# Function to check allowed file types
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# Function to extract receipt details using OCR
+def extract_details_from_receipt(image_path):
+    """Extracts shop name, date, total amount, and item details from a Dmart receipt"""
+
+    # Load and OCR the image
+    image = Image.open(image_path)
+    ocr_text = pytesseract.image_to_string(image)
+
+    # Extract shop name
+    shop_name = "Dmart" if "DMART" in ocr_text.upper() else "Unknown"
+
+    # Extract date (formats: dd/mm/yyyy or dd-mm-yyyy)
+    date_pattern = r'(\d{2}[/\-]\d{2}[/\-]\d{4})'
+    date_match = re.search(date_pattern, ocr_text)
+    date = date_match.group(0) if date_match else "Date not found"
+
+    # Extract total amount
+    total_pattern = r'Total\s*[:Rs.]\s([\d.,]+)'
+    total_match = re.search(total_pattern, ocr_text)
+    total_amount = f"Rs. {total_match.group(1)}" if total_match else "Total not found"
+
+    # Extract itemized details
+    items = []
+    item_pattern = re.compile(
+        r'(\d{6,})\s+([A-Z0-9\s\-?\/,.&]+)\s+[-~]\s*(\d+)\s+([\d.]+)\s+([\d.]+)'
+    )
+
+    for match in item_pattern.finditer(ocr_text):
+        item_code = match.group(1)
+        item_name = match.group(2).strip()
+        qty = int(match.group(3))
+        rate = float(match.group(4))
+        price = float(match.group(5))
+
+        items.append({
+            "code": item_code,
+            "item": item_name,
+            "quantity": qty,
+            "rate": rate,
+            "price": price
+        })
+
+    # Combine results
+    expense_details = {
+        "Shop Name": shop_name,
+        "Date": date,
+        "Total Amount": total_amount,
+        "Items": items
+    }
+
+    return expense_details
+
+@app.route('/api/ocr/upload', methods=['POST'])
+@token_required
+def upload_file(current_user):
+    """Handles image upload and performs OCR"""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+
+    file = request.files['file']
+
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    if file and allowed_file(file.filename):
+        # Use os.path.basename to safely handle filename
+        filename = os.path.basename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+       
+        # Save the uploaded image
+        file.save(filepath)
+
+        # Perform OCR extraction
+        results = extract_details_from_receipt(filepath)
+
+        # Clean up uploaded file
+        os.remove(filepath)
+
+        return jsonify(results)
+
+    return jsonify({"error": "Invalid file format"}), 400
+
+@app.route('/api/ocr/scan', methods=['GET'])
+@token_required
+def ocr_info(current_user):
+    return jsonify({"message": "Receipt OCR API is active", "supported_formats": list(ALLOWED_EXTENSIONS)})
+
 
 # ------------------------
 # Google OAuth & User Routes
