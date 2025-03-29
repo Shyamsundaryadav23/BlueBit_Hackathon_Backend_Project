@@ -546,7 +546,6 @@ def settle_group_debts(current_user, group_id):
 #     except Exception as e:
 #         logger.error(f"Expense error: {str(e)}")
 #         return jsonify({'error': 'Failed to create expense'}), 500
-
 @app.route("/api/expenses", methods=["POST", "OPTIONS"])
 @token_required
 def create_expense(current_user):
@@ -563,33 +562,44 @@ def create_expense(current_user):
         if not group:
             return jsonify({'error': 'Group not found'}), 404
             
-        user_email = current_user["Email"]
-        if group["createdBy"] != user_email and not any(m["email"] == user_email for m in group["members"]):
+        user_email = current_user.get("Email")
+        if not user_email:
+            return jsonify({'error': 'Current user email not found'}), 400
+
+        # Check authorization: current user's email must be in group's members or be the creator.
+        if group["createdBy"] != user_email and not any(m.get("email") == user_email for m in group.get("members", [])):
             return jsonify({'error': 'Unauthorized'}), 403
 
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         data.update({
             "createdBy": current_user["UserID"],
-            "paidBy": user_email,
+            "paidBy": user_email,  # You may later want to store the userID instead
             "createdAt": now,
             "updatedAt": now,
             "GroupID": group_id
         })
 
-        # Convert amount and update splits to use the actual UserID
+        # Convert amount and update splits to use the actual UserID from Users table.
         if "amount" in data:
             data["amount"] = Decimal(str(data["amount"]))
         if "splits" in data:
             for split in data["splits"]:
-                # Look up user by email (assuming split["memberId"] contains the email)
+                # We assume split["memberId"] is an email.
+                member_email = split.get("memberId")
+                if not member_email:
+                    # Skip or handle missing email as needed.
+                    logger.error("Split entry missing member email.")
+                    split["memberId"] = ""
+                    continue
+                # Query Users table via the EmailIndex
                 user_query = users_table.query(
                     IndexName="EmailIndex",
-                    KeyConditionExpression=Key("Email").eq(split["memberId"])
+                    KeyConditionExpression=Key("Email").eq(member_email)
                 )
                 if "Items" in user_query and len(user_query["Items"]) > 0:
                     split["memberId"] = user_query["Items"][0]["UserID"]
                 else:
-                    # If not found, you could either skip this split or set to an empty value
+                    logger.error(f"User with email {member_email} not found in Users table.")
                     split["memberId"] = ""
                 split["amount"] = Decimal(str(split["amount"]))
 
