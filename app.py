@@ -294,7 +294,7 @@ def callback():
             return jsonify({'error': 'Unable to fetch Google configuration'}), 500
         
         token_endpoint = google_cfg["token_endpoint"]
-        frontend_callback = os.getenv("FRONTEND_CALLBACK_URL", "http://localhost:5173/auth/callback")
+        frontend_callback = os.getenv("FRONTEND_CALLBACK_URL")
         logger.debug(f"Using redirect_uri for token exchange: {frontend_callback}")
         
         token_response = requests.post(
