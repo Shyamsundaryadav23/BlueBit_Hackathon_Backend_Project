@@ -1,8 +1,8 @@
 import eventlet
 eventlet.monkey_patch()
 import uuid
-
-from datetime import datetime, timezone
+import datetime
+from datetime import timezone
 import functools
 import logging
 import os
