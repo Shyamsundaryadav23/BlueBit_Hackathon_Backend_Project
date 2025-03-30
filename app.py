@@ -1,8 +1,8 @@
 import eventlet
 eventlet.monkey_patch()
-
 import uuid
-import datetime
+
+from datetime import datetime, timezone
 import functools
 import logging
 import os
@@ -959,7 +959,9 @@ def server_error(e):
     logger.error(f"500 Internal Server Error: {e}")
     return jsonify({'error': 'Internal server error'}), 500
 
-from datetime import datetime, timezone
+@app.route('/')
+def index():
+    return jsonify({"message": "Welcome to the API!"})
 
 # Health check endpoint
 @app.route('/health')
