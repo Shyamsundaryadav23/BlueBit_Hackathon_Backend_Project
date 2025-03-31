@@ -1,11 +1,15 @@
+# MUST BE FIRST - Monkey patch before ANY other imports
 from gevent import monkey
 monkey.patch_all()
 
+
+# Now import other modules
 import uuid
 from datetime import datetime, timezone, timedelta
 import functools
 import logging
 import os
+import ssl  # SSL imported after monkey patching
 import jwt
 import requests
 from flask import Flask, session, redirect, request, jsonify
