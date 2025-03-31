@@ -17,6 +17,9 @@ from decimal import Decimal
 from collections import defaultdict
 from flask_socketio import SocketIO, join_room, leave_room, emit
 
+from urllib.parse import urlencode
+from jwt.exceptions import InvalidTokenError, ExpiredSignatureError
+
 # OCR-related imports
 import re
 from PIL import Image
@@ -37,7 +40,8 @@ CORS(app,
      resources={r"/*": {
          "origins": "*",
          "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-         "allow_headers": ["Authorization", "Content-Type"]
+         "allow_headers": ["Authorization", "Content-Type"],
+         "expose_headers": ["Authorization"]
      }})
 
 app.secret_key = os.getenv('SECRET_KEY', os.urandom(24))
@@ -279,23 +283,147 @@ def login():
         logger.error(f"Login error: {e}")
         return jsonify({'error': 'Authentication process failed'}), 500
 
-@app.route("/api/callback")
+# @app.route("/api/callback")
+# def callback():
+#     try:
+#         code = request.args.get("code")
+#         if not code:
+#             logger.error("Authorization code missing in callback")
+#             return jsonify({'error': 'Authorization code missing'}), 400
+        
+#         logger.info(f"Received authorization code: {code}")
+#         google_cfg = get_google_provider_cfg()
+#         if not google_cfg:
+#             return jsonify({'error': 'Unable to fetch Google configuration'}), 500
+        
+#         token_endpoint = google_cfg["token_endpoint"]
+#         frontend_callback = os.getenv("FRONTEND_CALLBACK_URL", "http://localhost:5173/auth/callback")
+#         logger.debug(f"Using redirect_uri for token exchange: {frontend_callback}")
+        
+#         token_response = requests.post(
+#             token_endpoint,
+#             data={
+#                 "code": code,
+#                 "client_id": GOOGLE_CLIENT_ID,
+#                 "client_secret": GOOGLE_CLIENT_SECRET,
+#                 "redirect_uri": frontend_callback,
+#                 "grant_type": "authorization_code"
+#             }
+#         )
+#         if not token_response.ok:
+#             logger.error(f"Token exchange failed: {token_response.text}")
+#             return jsonify({'error': 'Failed to retrieve token from Google'}), 400
+        
+#         token_json = token_response.json()
+#         access_token = token_json.get("access_token")
+#         logger.debug(f"Access token received: {access_token}")
+        
+#         userinfo_endpoint = google_cfg["userinfo_endpoint"]
+#         userinfo_response = requests.get(
+#             userinfo_endpoint,
+#             headers={"Authorization": f"Bearer {access_token}"}
+#         )
+#         if not userinfo_response.ok:
+#             logger.error(f"User info fetch failed: {userinfo_response.text}")
+#             return jsonify({'error': 'Failed to retrieve user information'}), 400
+        
+#         userinfo = userinfo_response.json()
+#         logger.debug(f"User info: {userinfo}")
+        
+#         if not userinfo.get("email_verified", False):
+#             logger.error("Email not verified by Google")
+#             return jsonify({'error': 'Email not verified by Google'}), 400
+        
+#         email = userinfo["email"]
+#         logger.debug(f"User email: {email}")
+        
+#         query_response = users_table.query(
+#             IndexName="EmailIndex",
+#             KeyConditionExpression=Key("Email").eq(email)
+#         )
+        
+#         now_iso = datetime.now(timezone.utc).isoformat()  # Fixed datetime usage
+#         if query_response.get("Items"):
+#             user_record = query_response["Items"][0]
+#             user_id = user_record["UserID"]
+#             try:
+#                 users_table.update_item(
+#                     Key={"UserID": user_id},
+#                     UpdateExpression="SET #name = :name, picture = :picture, last_login = :last_login",
+#                     ExpressionAttributeNames={"#name": "name"},
+#                     ExpressionAttributeValues={
+#                         ":name": userinfo.get("name", ""),
+#                         ":picture": userinfo.get("picture", ""),
+#                         ":last_login": now_iso
+#                     }
+#                 )
+#                 user_record.update({
+#                     "name": userinfo.get("name", ""),
+#                     "picture": userinfo.get("picture", ""),
+#                     "last_login": now_iso
+#                 })
+#                 logger.info(f"Existing user updated: {email}")
+#             except Exception as e:
+#                 logger.error(f"DynamoDB update failed: {e}")
+#                 return jsonify({'error': 'Database operation failed'}), 500
+#         else:
+#             user_id = str(uuid.uuid4())
+#             user_record = {
+#                 "UserID": user_id,
+#                 "Email": email,
+#                 "name": userinfo.get("name", ""),
+#                 "picture": userinfo.get("picture", ""),
+#                 "created_at": now_iso,
+#                 "last_login": now_iso
+#             }
+#             try:
+#                 users_table.put_item(Item=user_record)
+#                 logger.info(f"New user created: {email} with UserID: {user_id}")
+#             except Exception as e:
+#                 logger.error(f"DynamoDB put_item failed: {e}")
+#                 return jsonify({'error': 'Database operation failed'}), 500
+        
+#         try:
+#             exp_time = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS)  # Fixed datetime and timedelta
+#             payload = {
+#                 'user_id': user_id,
+#                 'exp': exp_time
+#             }
+#             token = jwt.encode(payload, app.secret_key, algorithm='HS256')
+#             logger.debug("JWT token generated successfully")
+#             return jsonify({
+#                 'token': token,
+#                 'user': user_record,
+#                 'expires': exp_time.isoformat()
+#             })
+#         except Exception as e:
+#             logger.error(f"Token generation failed: {e}")
+#             return jsonify({'error': 'Authentication failed'}), 500
+#     except Exception as e:
+#         logger.error(f"Callback error: {e}")
+#         return jsonify({'error': 'Authentication process failed'}), 500
+
+
+# Updated callback route (replace existing)
+@app.route("/api/callback", methods=["GET", "POST"])
 def callback():
     try:
-        code = request.args.get("code")
+        # Handle both GET and POST requests
+        code = request.args.get("code") or (request.json and request.json.get("code"))
         if not code:
             logger.error("Authorization code missing in callback")
             return jsonify({'error': 'Authorization code missing'}), 400
-        
-        logger.info(f"Received authorization code: {code}")
+
+        logger.info(f"Processing OAuth callback with code: {code[:15]}...")
         google_cfg = get_google_provider_cfg()
         if not google_cfg:
             return jsonify({'error': 'Unable to fetch Google configuration'}), 500
-        
+
+        # Prepare token request
         token_endpoint = google_cfg["token_endpoint"]
         frontend_callback = os.getenv("FRONTEND_CALLBACK_URL", "http://localhost:5173/auth/callback")
-        logger.debug(f"Using redirect_uri for token exchange: {frontend_callback}")
         
+        # Exchange authorization code for tokens
         token_response = requests.post(
             token_endpoint,
             data={
@@ -304,100 +432,132 @@ def callback():
                 "client_secret": GOOGLE_CLIENT_SECRET,
                 "redirect_uri": frontend_callback,
                 "grant_type": "authorization_code"
-            }
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
+
         if not token_response.ok:
             logger.error(f"Token exchange failed: {token_response.text}")
-            return jsonify({'error': 'Failed to retrieve token from Google'}), 400
-        
-        token_json = token_response.json()
-        access_token = token_json.get("access_token")
-        logger.debug(f"Access token received: {access_token}")
-        
+            return jsonify({
+                'error': 'Failed to retrieve tokens',
+                'details': token_response.json()
+            }), 400
+
+        token_data = token_response.json()
+        access_token = token_data.get("access_token")
+        id_token = token_data.get("id_token")
+
+        # Get user info from Google
         userinfo_endpoint = google_cfg["userinfo_endpoint"]
         userinfo_response = requests.get(
             userinfo_endpoint,
             headers={"Authorization": f"Bearer {access_token}"}
         )
+
         if not userinfo_response.ok:
             logger.error(f"User info fetch failed: {userinfo_response.text}")
             return jsonify({'error': 'Failed to retrieve user information'}), 400
-        
+
         userinfo = userinfo_response.json()
-        logger.debug(f"User info: {userinfo}")
-        
+        logger.debug(f"User info received: {userinfo}")
+
+        # Validate email verification
         if not userinfo.get("email_verified", False):
             logger.error("Email not verified by Google")
             return jsonify({'error': 'Email not verified by Google'}), 400
-        
+
         email = userinfo["email"]
-        logger.debug(f"User email: {email}")
-        
-        query_response = users_table.query(
+        logger.info(f"Processing login for user: {email}")
+
+        # Check for existing user
+        response = users_table.query(
             IndexName="EmailIndex",
             KeyConditionExpression=Key("Email").eq(email)
         )
-        
-        now_iso = datetime.now(timezone.utc).isoformat()  # Fixed datetime usage
-        if query_response.get("Items"):
-            user_record = query_response["Items"][0]
-            user_id = user_record["UserID"]
-            try:
-                users_table.update_item(
-                    Key={"UserID": user_id},
-                    UpdateExpression="SET #name = :name, picture = :picture, last_login = :last_login",
-                    ExpressionAttributeNames={"#name": "name"},
-                    ExpressionAttributeValues={
-                        ":name": userinfo.get("name", ""),
-                        ":picture": userinfo.get("picture", ""),
-                        ":last_login": now_iso
-                    }
-                )
-                user_record.update({
-                    "name": userinfo.get("name", ""),
-                    "picture": userinfo.get("picture", ""),
-                    "last_login": now_iso
-                })
-                logger.info(f"Existing user updated: {email}")
-            except Exception as e:
-                logger.error(f"DynamoDB update failed: {e}")
-                return jsonify({'error': 'Database operation failed'}), 500
+        users = response.get("Items", [])
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if users:
+            # Update existing user
+            user = users[0]
+            update_expression = [
+                "SET #name = :name",
+                "picture = :picture",
+                "last_login = :last_login"
+            ]
+            expression_values = {
+                ":name": userinfo.get("name", user.get("name", "")),
+                ":picture": userinfo.get("picture", user.get("picture", "")),
+                ":last_login": now_iso
+            }
+            
+            users_table.update_item(
+                Key={"UserID": user["UserID"]},
+                UpdateExpression=", ".join(update_expression),  # Commas added here
+                ExpressionAttributeNames={"#name": "name"},
+                ExpressionAttributeValues=expression_values
+            )
+            user_id = user["UserID"]
+            logger.info(f"Updated existing user: {user_id}")
         else:
+            # Create new user
             user_id = str(uuid.uuid4())
-            user_record = {
+            new_user = {
                 "UserID": user_id,
                 "Email": email,
                 "name": userinfo.get("name", ""),
                 "picture": userinfo.get("picture", ""),
                 "created_at": now_iso,
-                "last_login": now_iso
+                "last_login": now_iso,
+                "verified": True
             }
-            try:
-                users_table.put_item(Item=user_record)
-                logger.info(f"New user created: {email} with UserID: {user_id}")
-            except Exception as e:
-                logger.error(f"DynamoDB put_item failed: {e}")
-                return jsonify({'error': 'Database operation failed'}), 500
+            
+            users_table.put_item(Item=new_user)
+            logger.info(f"Created new user: {user_id}")
+            user = new_user
+
+        # Generate JWT token
+        exp_time = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS)
+        token_payload = {
+            'user_id': user_id,
+            'exp': exp_time,
+            'email': email
+        }
         
         try:
-            exp_time = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS)  # Fixed datetime and timedelta
-            payload = {
-                'user_id': user_id,
-                'exp': exp_time
-            }
-            token = jwt.encode(payload, app.secret_key, algorithm='HS256')
-            logger.debug("JWT token generated successfully")
-            return jsonify({
-                'token': token,
-                'user': user_record,
-                'expires': exp_time.isoformat()
-            })
+            jwt_token = jwt.encode(token_payload, app.secret_key, algorithm='HS256')
         except Exception as e:
-            logger.error(f"Token generation failed: {e}")
-            return jsonify({'error': 'Authentication failed'}), 500
+            logger.error(f"JWT encoding failed: {str(e)}")
+            return jsonify({'error': 'Token generation failed'}), 500
+
+        # Prepare response
+        response_data = {
+            'token': jwt_token,
+            'user': {
+                'UserID': user_id,
+                'Email': email,
+                'name': user.get('name'),
+                'picture': user.get('picture')
+            },
+            'expires': exp_time.isoformat()
+        }
+
+        # For GET requests, redirect with token in URL hash
+        if request.method == "GET":
+            frontend_url = os.getenv("FRONTEND_CALLBACK_URL", "http://localhost:5173/auth/callback")
+            redirect_url = f"{frontend_url}#{urlencode(response_data)}"
+            return redirect(redirect_url)
+        
+        # For POST requests, return JSON
+        return jsonify(response_data), 200
+
     except Exception as e:
-        logger.error(f"Callback error: {e}")
-        return jsonify({'error': 'Authentication process failed'}), 500
+        logger.error(f"Callback processing failed: {str(e)}", exc_info=True)
+        return jsonify({
+            'error': 'Authentication process failed',
+            'details': str(e)
+        }), 500
+    
 
 @app.route("/api/user", methods=["GET"])
 @token_required
@@ -915,6 +1075,11 @@ def not_found(e):
 def server_error(e):
     logger.error(f"500 Internal Server Error: {e}")
     return jsonify({'error': 'Internal server error'}), 500
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    logger.error(f"405 Method Not Allowed: {str(e)}")
+    return jsonify({'error': 'Method not allowed'}), 405
 
 @app.route('/')
 def index():
