@@ -244,7 +244,7 @@ def login():
 @app.route("/api/callback")
 def callback():
     try:
-        frontend_base = os.getenv('FRONTEND_BASE_URL', 'http://localhost:5173')
+        frontend_base = os.getenv('FRONTEND_BASE_URL')
         if request.args.get('state') != session.get('oauth_state'):
             logger.error("State mismatch")
             return redirect(f"{frontend_base}/login?error=invalid_state")
