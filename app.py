@@ -2,7 +2,6 @@
 from gevent import monkey
 monkey.patch_all()
 
-
 # Now import other modules
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -244,7 +243,8 @@ def login():
 @app.route("/api/callback")
 def callback():
     try:
-        frontend_base = os.getenv('FRONTEND_BASE_URL')
+        # Use fallback value if FRONTEND_BASE_URL is not set
+        frontend_base = os.getenv('FRONTEND_BASE_URL', 'http://localhost:5173')
         if request.args.get('state') != session.get('oauth_state'):
             logger.error("State mismatch")
             return redirect(f"{frontend_base}/login?error=invalid_state")
@@ -338,7 +338,7 @@ def get_user(current_user):
 
 @app.route("/api/logout", methods=["POST"])
 @token_required
-def logout(current_user):
+def logout_endpoint(current_user):
     logger.info(f"User logged out: {current_user['Email']}")
     return jsonify({'message': 'Successfully logged out'})
 
