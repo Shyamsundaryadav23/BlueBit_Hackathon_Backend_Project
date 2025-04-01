@@ -198,7 +198,9 @@ def ocr_info(current_user):
 # OAuth Routes
 def get_google_provider_cfg():
     try:
-        return requests.get(GOOGLE_DISCOVERY_URL).json()
+        response = requests.get(GOOGLE_DISCOVERY_URL, timeout=5)
+        logger.debug(f"Google discovery response status: {response.status_code}")
+        return response.json()
     except requests.exceptions.RequestException as e:
         logger.error(f"Google config error: {e}")
         return None
