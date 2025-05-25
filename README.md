@@ -57,7 +57,7 @@ Utilities: Requests
 ⚙️ Setup & Installation
 1. Clone the Repository
 
-git clone https://github.com/yourusername/expense-tracker-backend.git
+git clone https://github.com/Shyamsundaryadav23/BlueBit_Hackathon_Backend_Project.git
 cd expense-tracker-backend
 2. Create a Virtual Environment
 
