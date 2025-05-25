@@ -1,4 +1,5 @@
-Expense Tracker Backend API
+Expense Tracker 
+Backend API
 A Flask-based backend API for an Expense Tracker app featuring:
 
 Google OAuth 2.0 authentication with JWT tokens
