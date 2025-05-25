@@ -1,18 +1,7 @@
-Expense Tracker 
-Backend API
-A Flask-based backend API for an Expense Tracker app featuring:
+🧾 Expense Tracker – Backend API
+A Flask-based backend API for the SplitBro Expense Tracker app, featuring real-time communication, OCR-based receipt scanning, secure authentication, and group/expense management.
 
-Google OAuth 2.0 authentication with JWT tokens
-
-User, Group, Expense, Transaction, and Chat management using AWS DynamoDB
-
-Receipt OCR scanning powered by Tesseract
-
-Real-time communication via WebSockets (SocketIO)
-
-Secure session and CORS handling
-
-Table of Contents
+📑 Table of Contents
 Features
 
 Tech Stack
@@ -35,145 +24,167 @@ Error Handling & Logging
 
 License
 
-Features
-Google OAuth 2.0 Login: Secure login using Google accounts with PKCE
+✨ Features
+🔐 Google OAuth 2.0 Login with PKCE for secure authentication
 
-JWT Authentication: Token-based secure API access
+🔑 JWT Authentication for token-based access
 
-DynamoDB Integration: Manage users, groups, expenses, transactions, and chats
+🧾 Receipt OCR powered by Tesseract for automated data extraction
 
-Receipt OCR: Upload images and extract details using Tesseract OCR
+🧑‍🤝‍🧑 User, Group, Expense, Transaction, and Chat Management via AWS DynamoDB
 
-SocketIO: Real-time updates and chat messaging
+📡 Real-time Communication with WebSockets (SocketIO)
 
-CORS & Session Management: Configured for frontend-backend communication
+🌐 CORS & secure Session Handling for frontend-backend integration
 
-Tech Stack
-Python 3.x
+🛠️ Tech Stack
+Language: Python 3.x
 
-Flask & Flask-SocketIO
+Frameworks: Flask, Flask-SocketIO
 
-AWS DynamoDB (via boto3)
+Database: AWS DynamoDB (boto3)
 
-JWT (PyJWT)
+Authentication: Google OAuth 2.0, JWT (PyJWT)
 
-Gevent for async concurrency
+OCR: Tesseract OCR, Pillow
 
-Tesseract OCR & Pillow for image processing
+Concurrency: Gevent
 
-dotenv for environment config
+Config: python-dotenv
 
-Requests for HTTP calls
+Utilities: Requests
 
-Setup & Installation
-Clone the repository
-
+⚙️ Setup & Installation
+1. Clone the Repository
 
 git clone https://github.com/yourusername/expense-tracker-backend.git
 cd expense-tracker-backend
-Create a virtual environment
-
+2. Create a Virtual Environment
 
 python -m venv venv
-venv\Scripts\activate  # Windows
-Install dependencies
-
+# Windows
+venv\Scripts\activate
+# macOS/Linux
+source venv/bin/activate
+3. Install Dependencies
 
 pip install -r requirements.txt
-Install Tesseract OCR
-
+4. Install Tesseract OCR
 Ubuntu/Debian:
 
 
 sudo apt-get install tesseract-ocr
-macOS (with Homebrew):
+macOS (Homebrew):
 
 
 brew install tesseract
 Windows:
+Download from Tesseract GitHub Wiki and add it to your system PATH.
 
-Download from https://github.com/tesseract-ocr/tesseract/wiki and add to PATH.
-
-Environment Variables
+🔐 Environment Variables
 Create a .env file in the root directory with the following:
 
-
+env
+Copy
+Edit
 SECRET_KEY=your_secret_key_here
 GOOGLE_CLIENT_ID=your_google_client_id
 GOOGLE_CLIENT_SECRET=your_google_client_secret
 BACKEND_CALLBACK_URL=http://localhost:5000/api/callback
 FRONTEND_BASE_URL=http://localhost:5173
 JWT_EXPIRATION_HOURS=24
+
 AWS_REGION=your_aws_region
 DYNAMODB_USERS_TABLE=Users
 DYNAMODB_GROUPS_TABLE=Groups
 DYNAMODB_EXPENSES_TABLE=Expenses
 DYNAMODB_TRANSACTIONS_TABLE=Transactions
 DYNAMODB_CHATS_TABLE=Chats
-Make sure AWS credentials are configured either via environment variables or AWS CLI.
+✅ Ensure your AWS credentials are configured (via ~/.aws/credentials or environment variables).
 
-Running the Server
+🚀 Running the Server
+Option 1: Standard Flask
 
 export FLASK_APP=app.py
-export FLASK_ENV=development  # Optional: enables debug mode
+export FLASK_ENV=development  # Optional for debug mode
 flask run
-Or with SocketIO support using gevent:
+Option 2: With WebSocket Support (Gevent)
 
 python -m gevent app.py
-API Endpoints
-Authentication
-GET /api/login - Redirects to Google OAuth login
+📡 API Endpoints
+🔐 Authentication
+GET /api/login – Redirects to Google OAuth login
 
-GET /api/callback - Google OAuth callback URL
+GET /api/callback – Handles the OAuth callback
 
-GET /api/user - Get current logged-in user profile (JWT required)
+GET /api/user – Get the current logged-in user (JWT required)
 
-POST /api/logout - Logout current user (JWT required)
+POST /api/logout – Log out the current user (JWT required)
 
-OCR
-POST /api/ocr/upload - Upload receipt image for OCR extraction (JWT required)
+🧾 OCR (Receipt Scanning)
+POST /api/ocr/upload – Upload receipt for OCR (JWT required)
 
-GET /api/ocr/scan - Check OCR API status and allowed file formats (JWT required)
+GET /api/ocr/scan – Check OCR API status and allowed file types (JWT required)
 
-Groups
-POST /api/groups - Create a new group (JWT required)
+👥 Groups
+POST /api/groups – Create a group (JWT required)
 
-GET /api/groups/<group_id> - Get group details (JWT required)
+GET /api/groups/<group_id> – Get group details (JWT required)
 
-PUT /api/groups/<group_id> - Update group (JWT required)
+PUT /api/groups/<group_id> – Update group (JWT required)
 
-DELETE /api/groups/<group_id> - Delete group (JWT required)
+DELETE /api/groups/<group_id> – Delete group (JWT required)
 
-GET /api/groups - List groups for current user (JWT required)
+GET /api/groups – List all groups for the user (JWT required)
 
-Expenses, Transactions, Chats, Dashboard
-(Include descriptions and routes as implemented)
+💰 Expenses, Transactions, Chats, Dashboard
+(Add detailed routes and their usage as implemented in your code)
 
-Authentication Flow
-User accesses /api/login and is redirected to Google OAuth consent screen.
+🔄 Authentication Flow
+User initiates login via GET /api/login.
 
-After consent, Google redirects to /api/callback with an authorization code.
+Redirected to Google OAuth consent screen.
 
-Backend exchanges code for access token, fetches user info, and stores/updates user in DynamoDB.
+After consent, redirected back to GET /api/callback.
 
-JWT token is created and sent back to frontend in URL fragment.
+Backend exchanges code for user info and creates JWT token.
 
-Frontend includes JWT token in Authorization header for subsequent API requests.
+JWT returned to frontend and stored securely.
 
-OCR Functionality
-Upload image files (png, jpg, jpeg) at /api/ocr/upload with JWT authorization.
+JWT is sent in Authorization header for all future API calls.
 
-Backend extracts shop name, date, total amount, and items from receipt using Tesseract OCR.
+🧾 OCR Functionality
+Upload PNG, JPG, or JPEG receipts using POST /api/ocr/upload.
 
-Returns JSON with extracted details.
+Backend uses Tesseract OCR to extract:
 
-Real-time Communication
-SocketIO initialized with Gevent async mode.
+Shop name
 
-Supports rooms, join/leave events, and message broadcasting (customize as per your app’s needs).
+Date
 
-Error Handling & Logging
-Standardized JSON error responses with appropriate HTTP status codes.
+Total amount
 
-Logging configured at WARNING level by default, debug logs available for deeper inspection.
+Itemized list
+
+Returns a JSON response with structured expense data.
+
+🔴 Real-time Communication (WebSockets)
+Powered by Socket.IO with Gevent for async.
+
+Custom events supported:
+
+Join/Leave group rooms
+
+Broadcast new messages/expenses
+
+Ideal for real-time notifications and chat.
+
+⚠️ Error Handling & Logging
+All endpoints return standardized JSON error messages.
+
+HTTP status codes reflect errors (400, 401, 403, 500).
+
+Logs enabled at WARNING level by default.
+
+Optional debug-level logs for development.
 
